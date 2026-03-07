@@ -7,7 +7,7 @@ from anthropic.types import TextBlock
 from discord import ApplicationContext, Message, Reaction
 from loguru import logger
 from openai import OpenAI
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
 
 from iqbot.config import Settings, settings
 
@@ -33,7 +33,7 @@ class ChatMessage:
 class GenAIBase:
     client: OpenAI | Anthropic
     settings: Settings
-    tokenizer: AutoTokenizer
+    tokenizer: Tokenizer
 
     def __init__(self):
         raise NotImplementedError(
@@ -186,13 +186,13 @@ class GenAIBase:
 
 class GenAIGpt(GenAIBase):
     client: OpenAI
-    tokenizer: AutoTokenizer
+    tokenizer: Tokenizer
 
     def __init__(self, settings: Settings) -> None:
         assert settings.genai.model.startswith("gpt"), "GenAIGpt requires a GPT model"
         self.settings = settings
         self.client = OpenAI(api_key=settings.tokens.gpt)
-        self.tokenizer = AutoTokenizer.from_pretrained("Xenova/gpt-4o")
+        self.tokenizer = Tokenizer.from_pretrained("Xenova/gpt-4o")
 
     async def _build_prompt(
         self, conversation: str, system_prompt: str, command_prompt: str
@@ -247,7 +247,7 @@ class GenAIGpt(GenAIBase):
 
 class GenAIAnthropic(GenAIBase):
     client: Anthropic
-    tokenizer: AutoTokenizer
+    tokenizer: Tokenizer
 
     def __init__(self, settings: Settings) -> None:
         assert settings.genai.model.split("-")[0] in (
@@ -258,7 +258,7 @@ class GenAIAnthropic(GenAIBase):
         ), "GenAIAnthropic requires an Anthropic model"
         self.settings = settings
         self.client = Anthropic(api_key=settings.tokens.anthropic)
-        self.tokenizer = AutoTokenizer.from_pretrained("Xenova/claude-tokenizer")
+        self.tokenizer = Tokenizer.from_pretrained("Xenova/claude-tokenizer")
 
     async def _build_prompt(
         self, conversation: str, system_prompt: Optional[str], command_prompt: str
