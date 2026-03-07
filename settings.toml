@@ -37,8 +37,8 @@ guild = 418288362747592704
 channel = 1179128812341047427
 roles = []
 
-[gpt]
-model = "gpt-4o"
+[genai]
+model = "claude-opus-4-6"
 system_prompt = """
 Answer questions strictly within the context of a provided conversation, consisting of a chronological series of user messages.
 When asked for a winner, first identify the main topic or question under dispute, inferred from the conversation itself. Then evaluate the primary disagreement between the two specified users. Consider subtopics only if they are meaningfully tied to this core issue. Ignore unrelated tangents or side disputes.
@@ -61,15 +61,15 @@ Hard constraint: Refer to users with the exact unicode characters and casing pro
 Hard constraint: Your entire response must not exceed 2000 characters. If necessary, prioritize substance, cut repetition, and trim soft qualifiers to stay within this limit.
 """
 
-[gpt.tokens]
+[genai.tokens]
 limit = 120000
 overhead_max = 20
 prompt_max = 100
 output_max = 400
 
-[gpt.history]
+[genai.history]
 minutes = 120
-messages = 200
+messages = 1000
 
 
 [elo]

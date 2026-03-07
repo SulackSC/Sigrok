@@ -1,14 +1,13 @@
-import re
 import tempfile
 from typing import Optional
 
-from discord import ApplicationContext, File, Member
+from discord import File
 from discord.commands import SlashCommandGroup
 from discord.ext import commands
 from discord.ext.commands import Context
 from loguru import logger
 
-from iqbot import db, gpt
+from iqbot import db, genai
 from iqbot.checks import bot_owner
 from iqbot.config import settings
 
@@ -83,7 +82,7 @@ class Owner(commands.Cog):
                     await ctx.respond("Message not found")
                     return
 
-                conversation = await gpt.read_context(message)
+                conversation = await genai.client.read_context(message)
                 if num_messages < conversation.count("\n"):
                     conversation = "\n".join(conversation.split("\n")[-num_messages:])
                 if len(conversation) >= 2000:
@@ -97,7 +96,7 @@ class Owner(commands.Cog):
 
         else:
             try:
-                conversation = await gpt.read_context(ctx)
+                conversation = await genai.client.read_context(ctx)
                 if num_messages < conversation.count("\n"):
                     conversation = "\n".join(conversation.split("\n")[-num_messages:])
                 if len(conversation) >= 2000:

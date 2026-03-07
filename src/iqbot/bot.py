@@ -5,10 +5,9 @@ import os
 
 from discord import Intents
 from discord.ext import commands
-from discord.ext.commands import Context
 from loguru import logger
 
-from iqbot import cogs, db
+from iqbot import db
 from iqbot.config import settings
 
 for i in range(5):

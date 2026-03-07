@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ from pydantic_settings import BaseSettings
 class Tokens(BaseModel):
     bot: str
     gpt: str
+    hf: str
+    anthropic: str
 
 
 class DatabaseSettings(BaseModel):
@@ -48,23 +51,23 @@ class BotSettings(BaseModel):
     whitelist: list[WhitelistEntry]
 
 
-class GptHistorySettings(BaseModel):
+class GenaiHistorySettings(BaseModel):
     minutes: int
     messages: int
 
 
-class GptTokenSettings(BaseModel):
+class GenaiTokenSettings(BaseModel):
     limit: int
     overhead_max: int
     output_max: int
     prompt_max: int
 
 
-class GptSettings(BaseModel):
+class GenaiSettings(BaseModel):
     model: str
     system_prompt: str
-    tokens: GptTokenSettings
-    history: GptHistorySettings
+    tokens: GenaiTokenSettings
+    history: GenaiHistorySettings
 
 
 class EloSettings(BaseModel):
@@ -75,7 +78,7 @@ class EloSettings(BaseModel):
 class Settings(BaseSettings):
     database: DatabaseSettings
     bot: BotSettings
-    gpt: GptSettings
+    genai: GenaiSettings
     elo: EloSettings
     tokens: Tokens
 
@@ -105,6 +108,8 @@ def load_settings() -> Settings:
 
 
 settings = load_settings()
+
+os.environ["HF_TOKEN"] = settings.tokens.hf
 
 
 if __name__ == "__main__":

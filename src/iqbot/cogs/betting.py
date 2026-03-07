@@ -3,17 +3,15 @@ import re
 from datetime import datetime, timedelta
 from enum import Enum
 from math import sqrt
-from typing import Any
 
 from discord import ApplicationContext, Member
-from discord.commands import Option
 from discord.ext import commands, tasks
 from discord.ext.commands import Bot
 from loguru import logger
 from sqlalchemy import select
 
-from iqbot import db, gpt
-from iqbot.checks import bot_manager, bot_owner
+from iqbot import db, genai
+from iqbot.checks import bot_manager
 from iqbot.config import settings
 from iqbot.db import Bet, User
 
@@ -108,13 +106,17 @@ class Betting(commands.Cog):
                 start_iq2 = user2.iq
 
                 prompt = f"Who won the argument, {member1.name} or {member2.name}?"
-                gpt_response = await gpt.send_prompt(
-                    reaction, settings.gpt.system_prompt, prompt
+                genai_response = await genai.client.send_prompt(
+                    reaction, settings.genai.system_prompt, prompt
                 )
-                match = re.search(r"(?<=winner:\s).+(?=\*\*)", gpt_response.lower())
+                match = re.search(r"(?<=winner:\s).+(?=\*\*)", genai_response.lower())
 
-                gpt_response = gpt_response.replace(member1.name, member1.display_name)
-                gpt_response = gpt_response.replace(member2.name, member2.display_name)
+                genai_response = genai_response.replace(
+                    member1.name, member1.display_name
+                )
+                genai_response = genai_response.replace(
+                    member2.name, member2.display_name
+                )
 
                 winner = match.group(0).strip() if match is not None else "error"
                 result = self.resolve_winner(member1, member2, winner)
@@ -125,7 +127,7 @@ class Betting(commands.Cog):
                     user2 = await session.merge(user2)
                     await session.commit()
 
-                await reaction.message.channel.send(gpt_response[0:1999])
+                await reaction.message.channel.send(genai_response[0:1999])
                 await reaction.message.channel.send(
                     f"{member1.display_name}\n{member1.mention} **IQ {start_iq1} -> {user1.iq}**\n{member2.mention} **IQ {start_iq2} -> {user2.iq}**"
                 )
@@ -227,10 +229,10 @@ class Betting(commands.Cog):
 
         try:
             prompt = f"Evaluate the debate between {member1.name} and {member2.name} on the topic: {topic}. Include the topic in the response."
-            gpt_response = await gpt.send_prompt(
-                ctx, settings.gpt.system_prompt, prompt
+            genai_response = await genai.client.send_prompt(
+                ctx, settings.genai.system_prompt, prompt
             )
-            match = re.search(r"(?<=winner:\s).+(?=\*\*)", gpt_response.lower())
+            match = re.search(r"(?<=winner:\s).+(?=\*\*)", genai_response.lower())
 
             winner = match.group(0).strip() if match is not None else "error"
             result = self.resolve_winner(member1, member2, winner)
@@ -244,11 +246,11 @@ class Betting(commands.Cog):
                     user2 = await session.merge(user2)
                     await session.commit()
 
-            await ctx.channel.send(gpt_response[0:1999])
+            await ctx.channel.send(genai_response[0:1999])
 
         except Exception as e:
             logger.error(f"Error in evaluate command: {e}")
-            await ctx.channel.send(f"**Error occurred while evaluating debate.**")
+            await ctx.channel.send("**Error occurred while evaluating debate.**")
 
 
 def setup(bot: commands.Bot):

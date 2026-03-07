@@ -4,7 +4,7 @@ from discord import ApplicationContext, Member
 from discord.ext import commands
 from loguru import logger
 
-from iqbot import gpt
+from iqbot import genai
 
 
 class Misc(commands.Cog):
@@ -45,10 +45,10 @@ class Misc(commands.Cog):
             )
 
             prompt = f"Please summarize the conversation between {member1.name} and {member2.name}. \n\n"
-            gpt_response = await gpt.send_prompt(ctx, system_prompt, prompt)
-            gpt_response = gpt_response.replace(member1.name, member1.display_name)
-            gpt_response = gpt_response.replace(member2.name, member2.display_name)
-            await ctx.respond(gpt_response[0:1999])
+            genai_response = await genai.client.send_prompt(ctx, system_prompt, prompt)
+            genai_response = genai_response.replace(member1.name, member1.display_name)
+            genai_response = genai_response.replace(member2.name, member2.display_name)
+            await ctx.respond(genai_response[0:1999])
 
         except Exception as e:
             logger.error(f"Error in on_reaction_add: {e}")
