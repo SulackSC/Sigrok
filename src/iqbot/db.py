@@ -147,6 +147,24 @@ async def upsert_user_iq(guild_id: int, user_id: int, iq: int) -> User:
     return user
 
 
+@db_logger
+async def adjust_user_iq(guild_id: int, user_id: int, delta: int) -> User:
+    async with get_session() as session:
+        stmt = select(User).where(User.user_id == user_id, User.guild_id == guild_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            user = User(user_id=user_id, guild_id=guild_id, iq=max(100 + delta, 0))
+            session.add(user)
+        else:
+            base_iq = user.iq if user.iq is not None else 100
+            user.iq = max(base_iq + delta, 0)
+
+        await session.commit()
+    return user
+
+
 async def read_top_iqs(guild_id: int) -> AsyncIterator[User]:
     async with get_session() as session:
         stmt = select(User).where(User.guild_id == guild_id, User.is_present)

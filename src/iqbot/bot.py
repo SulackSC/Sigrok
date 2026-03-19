@@ -35,6 +35,18 @@ async def on_ready():
             logger.info(f"Leaving unauthorized guild: {guild.name} ({guild.id})")
             await guild.leave()
 
+    # Keep the bot's slash command set aligned with the code currently loaded.
+    # Since we intentionally run without any user slash commands, this helps
+    # clear previously-registered ones in whitelisted guilds.
+    present_guilds = [
+        guild.id for guild in bot.guilds if guild.id in authorized_guilds
+    ]
+    try:
+        await bot.sync_commands(guild_ids=present_guilds)
+        logger.info(f"Synced slash commands to {len(present_guilds)} guild(s).")
+    except Exception as exc:
+        logger.error(f"Failed to sync slash commands: {exc}")
+
 
 @bot.event
 async def on_guild_join(guild):

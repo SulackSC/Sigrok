@@ -11,7 +11,7 @@ retention = 5
 [bot]
 prefix = "."
 temp_dir = "."
-cogs = ["owner", "admin", "misc", "betting", "iq", "presence", "backup"]
+cogs = ["misc", "presence", "backup"]
 
 [bot.owner]
 id = 477506746986921992
@@ -70,6 +70,16 @@ output_max = 400
 [genai.history]
 minutes = 120
 messages = 1000
+
+[genai.question]
+recent_messages = 5
+
+[genai.respect]
+enabled = true
+cooldown_seconds = 300
+min_chars = 20
+min_words = 4
+max_delta_per_message = 1
 
 
 [elo]

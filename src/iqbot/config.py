@@ -56,6 +56,18 @@ class GenaiHistorySettings(BaseModel):
     messages: int
 
 
+class GenaiQuestionSettings(BaseModel):
+    recent_messages: int
+
+
+class GenaiRespectSettings(BaseModel):
+    enabled: bool
+    cooldown_seconds: int
+    min_chars: int
+    min_words: int
+    max_delta_per_message: int
+
+
 class GenaiTokenSettings(BaseModel):
     limit: int
     overhead_max: int
@@ -68,6 +80,8 @@ class GenaiSettings(BaseModel):
     system_prompt: str
     tokens: GenaiTokenSettings
     history: GenaiHistorySettings
+    question: GenaiQuestionSettings
+    respect: GenaiRespectSettings
 
 
 class EloSettings(BaseModel):
