@@ -1,6 +1,6 @@
-# IQ Bot
+# Sigrok
 
-Discord bot with ELO system for discord debates with chatGPT as the judge :)
+Discord bot with ELO system for discord debates with some shitty SLM as the judge :)
 
 Expects a `.secrets.toml` file containing the API keys:
 
