@@ -1,5 +1,4 @@
 import datetime
-import re
 from datetime import datetime, timedelta
 from enum import Enum
 from math import sqrt
@@ -10,10 +9,10 @@ from discord.ext.commands import Bot
 from loguru import logger
 from sqlalchemy import select
 
-from iqbot import db, genai
-from iqbot.checks import bot_manager
-from iqbot.config import settings
-from iqbot.db import Bet, User
+from sigrok import db, genai
+from sigrok.checks import bot_manager
+from sigrok.config import settings
+from sigrok.db import Bet, User
 
 
 class BetResult(Enum):
@@ -105,11 +104,10 @@ class Betting(commands.Cog):
                 start_iq1 = user1.iq
                 start_iq2 = user2.iq
 
-                prompt = f"Who won the argument, {member1.name} or {member2.name}?"
-                genai_response = await genai.client.send_prompt(
-                    reaction, settings.genai.system_prompt, prompt
+                winner, genai_response = await genai.client.judge_debate(
+                    reaction,
+                    [member1.name, member2.name],
                 )
-                match = re.search(r"(?<=winner:\s).+(?=\*\*)", genai_response.lower())
 
                 genai_response = genai_response.replace(
                     member1.name, member1.display_name
@@ -118,7 +116,6 @@ class Betting(commands.Cog):
                     member2.name, member2.display_name
                 )
 
-                winner = match.group(0).strip() if match is not None else "error"
                 result = self.resolve_winner(member1, member2, winner)
 
                 if result in (BetResult.USER1, BetResult.USER2, BetResult.DRAW):
@@ -185,36 +182,6 @@ class Betting(commands.Cog):
         else:
             return
 
-    @commands.slash_command(name="bet", description="Initiates a bet between two users")
-    async def bet(self, ctx: ApplicationContext, member: Member):
-        if ctx.author == member:
-            await ctx.respond("You cannot bet against yourself!!")
-            return
-        if ctx.author == ctx.bot:
-            await ctx.respond("You cannot bet against the bot!!")
-            return
-
-        await ctx.respond(
-            f"{member.mention} you have been challenged by {ctx.author.mention} to bet IQ.\n\n DO YOU ACCEPT? OR ARE YOU A PUSSY??",
-        )
-
-        message = await ctx.interaction.original_response()
-
-        await message.add_reaction("✅")
-        await message.add_reaction("❌")
-
-        async with db.get_session() as session:
-            bet = Bet(
-                guild_id=ctx.guild.id,
-                message_id=message.id,
-                timestamp=message.created_at,
-                user_id_1=ctx.author.id,
-                user_id_2=member.id,
-            )
-            session.add(bet)
-            await session.commit()
-            logger.info(f"Bet added to DB: {bet}")
-
     @commands.command(
         name="evaluate",
         description="Evaluates a debate against a given debate topic (admin only)",
@@ -228,13 +195,11 @@ class Betting(commands.Cog):
             return
 
         try:
-            prompt = f"Evaluate the debate between {member1.name} and {member2.name} on the topic: {topic}. Include the topic in the response."
-            genai_response = await genai.client.send_prompt(
-                ctx, settings.genai.system_prompt, prompt
+            winner, genai_response = await genai.client.judge_debate(
+                ctx,
+                [member1.name, member2.name],
+                topic=topic,
             )
-            match = re.search(r"(?<=winner:\s).+(?=\*\*)", genai_response.lower())
-
-            winner = match.group(0).strip() if match is not None else "error"
             result = self.resolve_winner(member1, member2, winner)
 
             if result in (BetResult.USER1, BetResult.USER2, BetResult.DRAW):

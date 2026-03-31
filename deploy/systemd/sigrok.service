@@ -1,0 +1,32 @@
+# Sigrok Discord bot — install:
+#   sudo install -m 644 deploy/systemd/sigrok.service /etc/systemd/system/sigrok.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sigrok.service
+#
+# Edit User= and paths if your clone is not ~/Documents/Sigrok.
+# Python: use in-project venv (recommended):  poetry config virtualenvs.in-project true && poetry install
+#          then .venv/bin/python exists. Otherwise set ExecStart to the output of: poetry env info -p
+
+[Unit]
+Description=Sigrok Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sulack
+Group=sulack
+WorkingDirectory=/home/sulack/Documents/Sigrok
+
+# Loads settings.toml + .secrets.toml from WorkingDirectory
+ExecStart=/home/sulack/Documents/Sigrok/.venv/bin/python /home/sulack/Documents/Sigrok/src/sigrok/bot.py
+
+Restart=on-failure
+RestartSec=10
+
+# Hardening (optional; remove lines that break your setup)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

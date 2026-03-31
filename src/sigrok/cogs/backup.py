@@ -10,7 +10,7 @@ import discord
 from discord.ext import commands, tasks
 from loguru import logger
 
-from iqbot.config import settings
+from sigrok.config import settings
 
 
 def create_backup() -> str:

@@ -3,7 +3,7 @@ from discord.ext import commands
 from loguru import logger
 from sqlalchemy import select
 
-from iqbot.db import User, db_logger, get_session
+from sigrok.db import User, db_logger, get_session
 
 
 class Presence(commands.Cog):

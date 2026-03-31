@@ -1,6 +1,6 @@
 from discord.ext.commands import Context
 
-from iqbot.config import settings
+from sigrok.config import settings
 
 
 def bot_owner(ctx: Context):

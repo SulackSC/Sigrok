@@ -1,4 +1,5 @@
 backups*
+voice_recordings/
 conversation*
 .vscode
 logs
@@ -8,6 +9,10 @@ data.db
 trash**
 logs/*
 .env
+.bluesky_state.json
+# Local dumps / backups (may contain tokens or PII)
+sigrok_logs.txt
+settings.toml.backup*
 notes.md
 tests/_report.html
 

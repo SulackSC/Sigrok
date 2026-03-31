@@ -1,11 +1,5 @@
 import random
-from typing import Optional
-
-from discord import Member
 from discord.ext import commands
-from loguru import logger
-
-from iqbot import db
 
 
 class IQ(commands.Cog):
@@ -87,87 +81,6 @@ class IQ(commands.Cog):
                     f"{iq} IQ? Go touch grass — for science.",
                 ]
             )
-
-    @commands.slash_command(name="iq", description="checks bot latency")
-    async def iq(self, ctx, member: Optional[Member] = None):
-        try:
-            if member is None:
-                member = ctx.author
-
-            assert member is not None
-            user = await db.read_or_add_user(ctx.guild.id, member.id)
-            logger.info(f"Retrieved user: {user}")
-
-            if user.iq is None:
-                await ctx.respond(f"Error: {user.display_name} has no IQ set.")
-            else:
-                await ctx.respond(f"{member.mention} {self.iq_comment(user.iq)}")
-        except Exception as e:
-            logger.error(f"Error in ping command: {e}")
-
-    @commands.slash_command(name="top", description="Outputs top and bottom IQs")
-    async def top(self, ctx):
-        await ctx.defer()
-        try:
-            top_users = {}
-            bottom_users = {}
-
-            async with db.get_session() as session:
-                async for user in db.read_top_iqs(ctx.guild.id):
-                    try:
-                        member = await ctx.guild.fetch_member(user.user_id)
-                    except:
-                        member = None
-
-                    if member:
-                        top_users[member.id] = (member.display_name, user.iq)
-                    else:
-                        await session.merge(user)
-                        user.is_present = False
-                        await session.commit()
-
-                    if len(top_users) == 5:
-                        break
-
-                async for user in db.read_bottom_iqs(ctx.guild.id):
-                    try:
-                        member = await ctx.guild.fetch_member(user.user_id)
-                    except:
-                        member = None
-
-                    if member:
-                        if member.id not in top_users:
-                            bottom_users[member.id] = (member.display_name, user.iq)
-                        else:
-                            break
-                    else:
-                        await session.merge(user)
-                        user.is_present = False
-                        await session.commit()
-
-                    if len(bottom_users) == 5:
-                        break
-
-                await session.commit()
-
-            if not top_users and not bottom_users:
-                await ctx.respond("No qualifying members found.")
-                return
-
-            message = "## Top IQs\n"
-            for name, iq in top_users.values():
-                message += f"- {name}: {iq} IQ\n"
-
-            if bottom_users:
-                message += "\n## Bottom IQs\n"
-                for name, iq in sorted(bottom_users.values(), key=lambda x: -x[1]):
-                    message += f"- {name}: {iq} IQ\n"
-
-            await ctx.respond(message)
-
-        except Exception as e:
-            logger.error(f"Error in top command: {e}")
-            await ctx.respond("Error retrieving IQ data.")
 
 
 def setup(bot):

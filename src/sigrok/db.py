@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.future import select
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
-from iqbot.config import settings
+from sigrok.config import settings
 
 Base = declarative_base()
 
@@ -181,6 +181,15 @@ async def read_bottom_iqs(guild_id: int) -> AsyncIterator[User]:
         result = await session.stream(stmt)
         async for user in result.scalars():
             yield user
+
+
+@db_logger
+async def read_present_users(guild_id: int) -> list[User]:
+    async with get_session() as session:
+        stmt = select(User).where(User.guild_id == guild_id, User.is_present)
+        stmt = stmt.order_by(User.iq.desc(), User.user_id.asc())
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
 
 
 @db_logger

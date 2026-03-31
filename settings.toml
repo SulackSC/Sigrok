@@ -11,7 +11,7 @@ retention = 5
 [bot]
 prefix = "."
 temp_dir = "."
-cogs = ["misc", "presence", "backup"]
+cogs = ["misc", "presence", "backup", "voice_rec", "bluesky"]
 
 [bot.owner]
 id = 477506746986921992
@@ -21,6 +21,13 @@ guilds = true
 messages = true
 message_content = true
 reactions = true
+voice_states = true
+
+[bot.voice_record]
+chunk_seconds = 30
+directory = "voice_recordings"
+announcement_file = ""
+announcement_interval_seconds = 60
 
 [[bot.whitelist]]
 guild = 1361882687895371838
@@ -37,8 +44,20 @@ guild = 418288362747592704
 channel = 1179128812341047427
 roles = []
 
+[[bot.whitelist]]
+guild = 493226632501526548
+channel = 0
+roles = []
+
 [genai]
-model = "claude-opus-4-6"
+# Active backend (native llama-server on localhost:8081, model alias from llama-server.service).
+model = "llamacpp/qwen3.5-27b"
+base_url = "http://127.0.0.1:8081"
+temperature = 1.05
+repeat_penalty = 1.15
+# Rollback (Ollama):
+# model = "ollama/qwen3:14b"
+# base_url = "http://127.0.0.1:11434"
 system_prompt = """
 Answer questions strictly within the context of a provided conversation, consisting of a chronological series of user messages.
 When asked for a winner, first identify the main topic or question under dispute, inferred from the conversation itself. Then evaluate the primary disagreement between the two specified users. Consider subtopics only if they are meaningfully tied to this core issue. Ignore unrelated tangents or side disputes.
@@ -65,14 +84,20 @@ Hard constraint: Your entire response must not exceed 2000 characters. If necess
 limit = 120000
 overhead_max = 20
 prompt_max = 100
-output_max = 400
+# For Ollama thinking models: needs room for reasoning + final answer
+output_max = 1024
 
 [genai.history]
 minutes = 120
 messages = 1000
 
 [genai.question]
-recent_messages = 5
+recent_messages = 10
+
+[genai.web_search]
+enabled = true
+max_results = 5
+timeout_seconds = 10
 
 [genai.respect]
 enabled = true
@@ -85,3 +110,17 @@ max_delta_per_message = 1
 [elo]
 max_delta = 10
 scale = 500
+
+[social.bluesky]
+enabled = true
+identifier = ""
+password = ""
+max_chars = 300
+poll_seconds = 30
+state_file = ".bluesky_state.json"
+thread_parent_height = 8
+
+[social.x]
+enabled = false
+bearer_token = ""
+max_chars = 280

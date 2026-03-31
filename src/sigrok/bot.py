@@ -7,8 +7,8 @@ from discord import Intents
 from discord.ext import commands
 from loguru import logger
 
-from iqbot import db
-from iqbot.config import settings
+from sigrok import db
+from sigrok.config import settings
 
 for i in range(5):
     logger.add(f"logs/file{i}.log", rotation="10 MB")
@@ -22,7 +22,7 @@ if not os.path.exists("data.db"):
 
 for cog in settings.bot.cogs:
     logger.info(f"Loading {cog} cog...")
-    bot.load_extension(f"cogs.{cog}")
+    bot.load_extension(f"sigrok.cogs.{cog}")
 
 
 @bot.event
@@ -35,17 +35,18 @@ async def on_ready():
             logger.info(f"Leaving unauthorized guild: {guild.name} ({guild.id})")
             await guild.leave()
 
-    # Keep the bot's slash command set aligned with the code currently loaded.
-    # Since we intentionally run without any user slash commands, this helps
-    # clear previously-registered ones in whitelisted guilds.
+    # Keep Discord's registered slash-command list empty now that the bot no
+    # longer exposes any slash commands.
     present_guilds = [
         guild.id for guild in bot.guilds if guild.id in authorized_guilds
     ]
     try:
         await bot.sync_commands(guild_ids=present_guilds)
-        logger.info(f"Synced slash commands to {len(present_guilds)} guild(s).")
+        logger.info(
+            f"Cleared slash commands in {len(present_guilds)} authorized guild(s)."
+        )
     except Exception as exc:
-        logger.error(f"Failed to sync slash commands: {exc}")
+        logger.error(f"Failed to clear slash commands: {exc}")
 
 
 @bot.event

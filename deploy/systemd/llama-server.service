@@ -1,0 +1,19 @@
+[Unit]
+Description=llama.cpp OpenAI-compatible model server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sulack
+Group=sulack
+WorkingDirectory=/home/sulack/Documents/Sigrok
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/sulack/llamacpp-venv/bin/python -m llama_cpp.server --model /home/ollama/.ollama/models/blobs/sha256-a8cc1361f3145dc01f6d77c6c82c9116b9ffe3c97b34716fe20418455876c40e --model_alias qwen3-14b --host 127.0.0.1 --port 8081 --n_ctx 8192 --n_gpu_layers -1 --tensor_split 0.5 0.5 --n_batch 128 --n_ubatch 128 --api_key sk-no-key-required
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

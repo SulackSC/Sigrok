@@ -3,15 +3,41 @@ from pathlib import Path
 from typing import Any
 
 import tomli
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import BaseSettings
 
 
 class Tokens(BaseModel):
     bot: str
-    gpt: str
-    hf: str
-    anthropic: str
+    gpt: str = ""
+    hf: str = ""
+    anthropic: str = ""
+
+
+class BlueskySettings(BaseModel):
+    enabled: bool = False
+    # Login identifier, e.g. "alice.bsky.social"
+    identifier: str = ""
+    # App password (not your primary account password).
+    password: str = ""
+    api_base_url: str = "https://bsky.social"
+    max_chars: int = 300
+    poll_seconds: int = 30
+    state_file: str = ".bluesky_state.json"
+    thread_parent_height: int = 8
+
+
+class XSettings(BaseModel):
+    enabled: bool = False
+    # OAuth2 "access token" (bearer) scoped for posting.
+    bearer_token: str = ""
+    api_base_url: str = "https://api.x.com"
+    max_chars: int = 280
+
+
+class SocialSettings(BaseModel):
+    bluesky: BlueskySettings = Field(default_factory=BlueskySettings)
+    x: XSettings = Field(default_factory=XSettings)
 
 
 class DatabaseSettings(BaseModel):
@@ -34,12 +60,25 @@ class IntentsSettings(BaseModel):
     messages: bool
     message_content: bool
     reactions: bool
+    voice_states: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("voice_states", "guild_voice_states"),
+    )
 
 
 class WhitelistEntry(BaseModel):
     guild: int
     channel: int
     roles: list[int]
+
+
+class VoiceRecordSettings(BaseModel):
+    """Chunked voice capture (see cogs.voice_rec)."""
+
+    chunk_seconds: int = 30
+    directory: str = "voice_recordings"
+    announcement_file: str = ""
+    announcement_interval_seconds: int = 60
 
 
 class BotSettings(BaseModel):
@@ -49,6 +88,7 @@ class BotSettings(BaseModel):
     owner: OwnerSettings
     intents: IntentsSettings
     whitelist: list[WhitelistEntry]
+    voice_record: VoiceRecordSettings = Field(default_factory=VoiceRecordSettings)
 
 
 class GenaiHistorySettings(BaseModel):
@@ -58,6 +98,12 @@ class GenaiHistorySettings(BaseModel):
 
 class GenaiQuestionSettings(BaseModel):
     recent_messages: int
+
+
+class GenaiWebSearchSettings(BaseModel):
+    enabled: bool = False
+    max_results: int = 5
+    timeout_seconds: int = 10
 
 
 class GenaiRespectSettings(BaseModel):
@@ -77,10 +123,20 @@ class GenaiTokenSettings(BaseModel):
 
 class GenaiSettings(BaseModel):
     model: str
+    base_url: str = "http://127.0.0.1:11434"
     system_prompt: str
+    temperature: float = Field(
+        default=1.2,
+        validation_alias=AliasChoices("temperature", "ollama_temperature"),
+    )
+    repeat_penalty: float = Field(
+        default=1.2,
+        validation_alias=AliasChoices("repeat_penalty", "ollama_repeat_penalty"),
+    )
     tokens: GenaiTokenSettings
     history: GenaiHistorySettings
     question: GenaiQuestionSettings
+    web_search: GenaiWebSearchSettings = GenaiWebSearchSettings()
     respect: GenaiRespectSettings
 
 
@@ -95,6 +151,7 @@ class Settings(BaseSettings):
     genai: GenaiSettings
     elo: EloSettings
     tokens: Tokens
+    social: SocialSettings = Field(default_factory=SocialSettings)
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -123,7 +180,8 @@ def load_settings() -> Settings:
 
 settings = load_settings()
 
-os.environ["HF_TOKEN"] = settings.tokens.hf
+if settings.tokens.hf:
+    os.environ["HF_TOKEN"] = settings.tokens.hf
 
 
 if __name__ == "__main__":

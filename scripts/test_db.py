@@ -1,4 +1,4 @@
-from iqbot import db
+from sigrok import db
 
 
 async def async_main():

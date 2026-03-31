@@ -5,8 +5,8 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from alembic import context
-from iqbot.config import settings
-from iqbot.db import Base
+from sigrok.config import settings
+from sigrok.db import Base
 
 config = context.config
 
