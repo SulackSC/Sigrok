@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomli
 from pydantic import AliasChoices, BaseModel, Field
@@ -60,6 +60,7 @@ class IntentsSettings(BaseModel):
     messages: bool
     message_content: bool
     reactions: bool
+    members: bool = False
     voice_states: bool = Field(
         default=False,
         validation_alias=AliasChoices("voice_states", "guild_voice_states"),
@@ -81,6 +82,25 @@ class VoiceRecordSettings(BaseModel):
     announcement_interval_seconds: int = 60
 
 
+class EventPostRule(BaseModel):
+    """Post to a channel when a member joins or leaves (see cogs.conditional_posts)."""
+
+    guild: int
+    channel: int
+    on: Literal["join", "leave"]
+    message: str
+    ignore_bots: bool = True
+
+
+class TimedPostRule(BaseModel):
+    """Post to a channel on a fixed interval (see cogs.conditional_posts)."""
+
+    guild: int
+    channel: int
+    interval_minutes: int
+    message: str
+
+
 class BotSettings(BaseModel):
     prefix: str
     temp_dir: str
@@ -89,6 +109,8 @@ class BotSettings(BaseModel):
     intents: IntentsSettings
     whitelist: list[WhitelistEntry]
     voice_record: VoiceRecordSettings = Field(default_factory=VoiceRecordSettings)
+    event_posts: list[EventPostRule] = Field(default_factory=list)
+    timed_posts: list[TimedPostRule] = Field(default_factory=list)
 
 
 class GenaiHistorySettings(BaseModel):
@@ -106,12 +128,9 @@ class GenaiWebSearchSettings(BaseModel):
     timeout_seconds: int = 10
 
 
-class GenaiRespectSettings(BaseModel):
-    enabled: bool
-    cooldown_seconds: int
-    min_chars: int
-    min_words: int
-    max_delta_per_message: int
+class GenaiDiscordStreamingSettings(BaseModel):
+    enabled: bool = False
+    edit_interval_seconds: float = 4.0
 
 
 class GenaiTokenSettings(BaseModel):
@@ -124,7 +143,6 @@ class GenaiTokenSettings(BaseModel):
 class GenaiSettings(BaseModel):
     model: str
     base_url: str = "http://127.0.0.1:11434"
-    system_prompt: str
     temperature: float = Field(
         default=1.2,
         validation_alias=AliasChoices("temperature", "ollama_temperature"),
@@ -133,11 +151,14 @@ class GenaiSettings(BaseModel):
         default=1.2,
         validation_alias=AliasChoices("repeat_penalty", "ollama_repeat_penalty"),
     )
+    request_timeout: float = 120.0
     tokens: GenaiTokenSettings
     history: GenaiHistorySettings
     question: GenaiQuestionSettings
     web_search: GenaiWebSearchSettings = GenaiWebSearchSettings()
-    respect: GenaiRespectSettings
+    discord_streaming: GenaiDiscordStreamingSettings = Field(
+        default_factory=GenaiDiscordStreamingSettings
+    )
 
 
 class EloSettings(BaseModel):

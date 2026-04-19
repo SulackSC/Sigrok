@@ -1,20 +1,23 @@
 import asyncio
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timezone
+from typing import Optional
 
 from discord import Message
 from discord.errors import Forbidden, HTTPException
 from discord.ext import commands
 from loguru import logger
 
-from sigrok import db, genai
+from sigrok import genai
 from sigrok.config import settings
-from sigrok.genai import SIGROK_PERSONALITY_SYSTEM_PROMPT
+from sigrok.genai import GenAILlamaCpp, SIGROK_PERSONALITY_SYSTEM_PROMPT
 
 
 class Misc(commands.Cog):
     bot: commands.Bot
-    IQ_BOT_APP_ID = 1361882951935197244
+    # Scheduled @schedule jobs: cap how many human turns feed the SLM (plus bot lines in window).
+    _DEFERRED_SCHEDULE_RECENT_HUMAN_TURNS = 5
     _RESPONSE_STOP_WORDS = {
         "a",
         "about",
@@ -51,7 +54,6 @@ class Misc(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.respect_cooldowns: dict[tuple[int, int], datetime] = {}
 
     async def _format_reply_chain_snippet(
         self,
@@ -146,6 +148,22 @@ class Misc(commands.Cog):
             question = question.replace(mention, " ")
         return " ".join(question.split()).strip()
 
+    def _strip_bot_mention_raw(self, content: str) -> str:
+        """Strip bot mention tokens from raw message content (preserves @schedule, etc.)."""
+        if self.bot.user is None:
+            return content.strip()
+        mention_patterns = [
+            f"<@{self.bot.user.id}>",
+            f"<@!{self.bot.user.id}>",
+            f"@{self.bot.user.name}",
+        ]
+        out = content
+        for mention in mention_patterns:
+            out = out.replace(mention, " ")
+        # Preserve newlines — do not " ".join(all.split()) or multi-line @schedule bodies collapse.
+        lines = [" ".join(line.split()) for line in out.splitlines()]
+        return "\n".join(lines).strip()
+
     def _message_mentions_self(self, message: Message) -> bool:
         if self.bot.user is None:
             return False
@@ -163,53 +181,6 @@ class Misc(commands.Cog):
 
         clean_content = (message.clean_content or "").lower()
         return f"@{self.bot.user.name}".lower() in clean_content
-
-    def _is_iq_bot_bet_challenge(self, message: Message) -> bool:
-        if self.bot.user is None or message.guild is None:
-            return False
-        if not self._is_whitelisted_guild(message):
-            return False
-        if not self._message_mentions_self(message):
-            return False
-
-        author_id = getattr(message.author, "id", None)
-        application_id = getattr(message, "application_id", None)
-        if author_id != self.IQ_BOT_APP_ID and application_id != self.IQ_BOT_APP_ID:
-            return False
-
-        content = message.content.lower()
-        required_fragments = (
-            "you have been challenged by",
-            "to bet iq",
-            "do you accept",
-        )
-        return all(fragment in content for fragment in required_fragments)
-
-    async def _auto_accept_iq_bot_bet(self, message: Message) -> bool:
-        if not self._is_iq_bot_bet_challenge(message):
-            return False
-
-        for reaction in message.reactions:
-            if str(reaction.emoji) == "✅" and reaction.me:
-                return True
-
-        try:
-            await asyncio.sleep(2)
-
-            for reaction in message.reactions:
-                if str(reaction.emoji) == "✅" and reaction.me:
-                    return True
-
-            await message.add_reaction("✅")
-            logger.info(
-                f"Auto-accepted IQ Bot challenge in guild={getattr(message.guild, 'id', None)} "
-                f"channel={getattr(message.channel, 'id', None)} message={message.id}"
-            )
-        except (Forbidden, HTTPException) as exc:
-            logger.warning(
-                f"Failed to auto-accept IQ Bot challenge message {message.id}: {exc}"
-            )
-        return True
 
     def _extract_target_user_ids(self, message: Message, question: str) -> set[int]:
         target_user_ids = {
@@ -238,30 +209,6 @@ class Misc(commands.Cog):
 
         return target_user_ids
 
-    def _should_score_message(self, message: Message) -> bool:
-        if not settings.genai.respect.enabled:
-            return False
-        if message.guild is None or not self._is_whitelisted_channel(message):
-            return False
-        if message.author.bot:
-            return False
-        if self.bot.user and self.bot.user in message.mentions:
-            return False
-
-        content = message.content.strip()
-        if len(content) < settings.genai.respect.min_chars:
-            return False
-        if len(content.split()) < settings.genai.respect.min_words:
-            return False
-
-        cooldown_key = (message.guild.id, message.author.id)
-        last_scored_at = self.respect_cooldowns.get(cooldown_key)
-        if last_scored_at is None:
-            return True
-
-        elapsed_seconds = (message.created_at - last_scored_at).total_seconds()
-        return elapsed_seconds >= settings.genai.respect.cooldown_seconds
-
     async def _send_response_to_ping(self, message: Message, text: str) -> None:
         """
         Prefer a real Discord reply (message reference). If Discord returns 403 (usually
@@ -281,6 +228,180 @@ class Misc(commands.Cog):
                     f"channel_id={message.channel.id} guild_id={getattr(message.guild, 'id', None)}"
                 )
                 await message.channel.send(text)
+
+    async def _send_ping_returning_message(self, message: Message, text: str) -> Message:
+        """Same routing as _send_response_to_ping but returns the sent Message for edits."""
+        text = text[:1999]
+        ref = message.to_reference(fail_if_not_exists=False)
+        try:
+            return await message.channel.send(text, reference=ref, mention_author=False)
+        except Forbidden:
+            try:
+                return await message.channel.send(
+                    text, reference=message, mention_author=False
+                )
+            except Forbidden:
+                logger.warning(
+                    "Reply blocked (likely no Read Message History); sending plain message. "
+                    f"channel_id={message.channel.id} guild_id={getattr(message.guild, 'id', None)}"
+                )
+                return await message.channel.send(text)
+
+    @staticmethod
+    async def _safe_edit_mention_message(msg: Message, content: str) -> None:
+        content = (content or "…")[:1999]
+        try:
+            await msg.edit(content=content)
+        except HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                await asyncio.sleep(2.0)
+                try:
+                    await msg.edit(content=content)
+                except Exception as e2:
+                    logger.warning(f"Streaming reply edit retry failed: {e2}")
+            else:
+                logger.warning(f"Streaming reply edit failed: {exc}")
+
+    @staticmethod
+    def _mention_streaming_eligible(has_images: bool) -> bool:
+        # Streaming disabled globally: tools (search_web/fetch_url) only fire on
+        # the non-streaming path, and bulk delivery is fine.
+        return False
+
+    def _post_process_mention_reply(self, text: str) -> str:
+        text = self._strip_transcript_format(text)
+        text = re.sub(r"^sigrok:\s*", "", text, flags=re.IGNORECASE).strip()
+        text = self._strip_bot_mention(text)
+        return self._normalize_bot_response(text)
+
+    def _mention_reply_is_failure(self, question: str, r: str) -> bool:
+        r = r.strip()
+        return (
+            not r
+            or r.lower() == question.lower().strip()
+            or (len(r) < 200 and r in SIGROK_PERSONALITY_SYSTEM_PROMPT)
+            or r in {"not worth my time", "I couldn't answer that right now."}
+        )
+
+    @staticmethod
+    def _deferred_self_post_llm_prompt(scheduled: str) -> str:
+        """
+        Frame @schedule / cron prompts so the model writes a channel post as Sigrok,
+        not a reply to a user ping.
+        """
+        text = scheduled.strip()
+        return (
+            "You are not answering anyone or reacting to a ping. You are Sigrok posting in this "
+            "channel of your own accord — write in your voice as a normal message.\n\n"
+            f"You decide to: {text}\n\n"
+            "Output only the text you send in Discord (no preamble, no addressing the scheduler, "
+            "no 'In response to' or similar)."
+        )
+
+    async def _streaming_mention_turn(
+        self,
+        message: Message,
+        question: str,
+        target_user_ids: Optional[set[int]],
+        retry_hint: Optional[str],
+        typing_ctx: Optional[object] = None,
+        history_before: Optional[datetime] = None,
+        *,
+        recent_context_human_turns: Optional[int] = None,
+        merge_reply_chain: bool = True,
+    ) -> tuple[Optional[Message], str]:
+        """
+        Stream one llama.cpp completion into a reply message. Returns (reply_msg, processed_text).
+        processed_text empty means hard failure (placeholder already updated when possible).
+        typing_ctx: if provided, an already-entered typing context to exit after first post.
+        """
+        interval = float(settings.genai.discord_streaming.edit_interval_seconds)
+        agen = genai.client.answer_message_question_streaming(
+            message,
+            question,
+            target_user_ids,
+            retry_hint=retry_hint,
+            history_before=history_before,
+            recent_context_human_turns=recent_context_human_turns,
+            merge_reply_chain=merge_reply_chain,
+        )
+        _strip = getattr(
+            genai.client, "_strip_think_block", lambda c: (c or "").strip()
+        )
+
+        try:
+            first = await agen.__anext__()
+        except StopAsyncIteration:
+            return None, ""
+        reply_msg: Optional[Message] = None
+        owns_typing = typing_ctx is None
+        if owns_typing:
+            typing_ctx = message.channel.typing()
+            await typing_ctx.__aenter__()
+        typing_active = True
+
+        def _visible(raw: str) -> str:
+            text = _strip(raw)
+            return text.strip() or "…"
+
+        async def _stop_typing() -> None:
+            nonlocal typing_active
+            if typing_active and typing_ctx is not None:
+                try:
+                    await typing_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                typing_active = False
+
+        try:
+            delta_count = 0
+            typing_start = time.monotonic()
+            acc = first
+            async for delta in agen:
+                acc += delta
+                delta_count += 1
+                now = time.monotonic()
+                if reply_msg is None:
+                    if now - typing_start >= interval:
+                        reply_msg = await self._send_ping_returning_message(message, _visible(acc))
+                        logger.info(
+                            f"Streaming first post for message={message.id} "
+                            f"after {now - typing_start:.1f}s, {delta_count} deltas, {len(acc)} chars"
+                        )
+                        await _stop_typing()
+                        last_edit = now
+                else:
+                    if now - last_edit >= interval:
+                        await self._safe_edit_mention_message(reply_msg, _visible(acc))
+                        last_edit = now
+            await _stop_typing()
+            logger.info(
+                f"Streaming done for message={message.id}: "
+                f"{delta_count} deltas, {len(acc)} chars total, posted={'yes' if reply_msg else 'no'}"
+            )
+        except Exception as exc:
+            logger.error(f"Streaming mention failed: {exc}")
+            await _stop_typing()
+            if reply_msg is not None:
+                await self._safe_edit_mention_message(
+                    reply_msg, "I couldn't answer that right now."
+                )
+            return reply_msg, ""
+
+        final_raw = acc.strip()
+        if not final_raw:
+            if reply_msg is not None:
+                await self._safe_edit_mention_message(
+                    reply_msg, "I couldn't answer that right now."
+                )
+            return reply_msg, ""
+
+        out = self._post_process_mention_reply(_strip(final_raw))
+        if reply_msg is None:
+            reply_msg = await self._send_ping_returning_message(message, out[:1999])
+        else:
+            await self._safe_edit_mention_message(reply_msg, out[:1999])
+        return reply_msg, out
 
     async def _react_to_failed_llm_response(self, message: Message) -> None:
         for emoji in ("🫃", "❌"):
@@ -313,40 +434,117 @@ class Misc(commands.Cog):
         return False
 
     async def _handle_bot_mention(self, message: Message) -> None:
+        raw_stripped = self._strip_bot_mention_raw(message.content or "")
+        if re.search(r"(?i)@schedule\b", raw_stripped):
+            sched = self.bot.get_cog("ConditionalPosts")
+            if sched is not None and await sched.handle_schedule_mention(message):
+                return
+
         question = self._strip_bot_mention(message.clean_content)
+        has_images = genai.client._message_has_images(message)
+        if (
+            not has_images
+            and message.reference
+            and message.reference.message_id is not None
+        ):
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+                has_images = genai.client._message_has_images(ref)
+            except Exception:
+                pass
         logger.info(
             f"Mention received in guild={getattr(message.guild, 'id', None)} "
             f"channel={getattr(message.channel, 'id', None)} message={message.id}: {question}"
         )
         if not question:
-            async with message.channel.typing():
-                await self._send_response_to_ping(message, "Ask me something after the ping.")
-            return
+            if has_images:
+                question = "Describe this image."
+            else:
+                async with message.channel.typing():
+                    await self._send_response_to_ping(message, "Ask me something after the ping.")
+                return
 
         target_user_ids = self._extract_target_user_ids(message, question)
-        if target_user_ids:
-            # Keep asker in transcript when filtering by @user / name (not role-based; was excluding pinger)
-            target_user_ids = target_user_ids | {message.author.id}
+        target_user_ids = target_user_ids | {message.author.id}
         is_reply_chain = bool(message.reference and message.reference.message_id)
-        has_images = genai.client._message_has_images(message)
         if not has_images and is_reply_chain:
             try:
                 ref = await message.channel.fetch_message(message.reference.message_id)
                 has_images = genai.client._message_has_images(ref)
             except Exception:
                 pass
+
+        stream_ok = self._mention_streaming_eligible(has_images)
+        reply_msg: Optional[Message] = None
+        response = ""
+
+        if stream_ok:
+            typing_ctx = message.channel.typing()
+            await typing_ctx.__aenter__()
+            try:
+                reply_msg, response = await self._streaming_mention_turn(
+                    message, question, target_user_ids or None,
+                    retry_hint=None, typing_ctx=typing_ctx,
+                )
+            except RuntimeError as exc:
+                logger.warning(f"Mention streaming unavailable ({exc}); falling back.")
+                try:
+                    await typing_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                stream_ok = False
+
+            if stream_ok and response and not self._mention_reply_is_failure(question, response):
+                if not has_images and self._response_needs_retry(
+                    question, response, is_reply_chain=is_reply_chain
+                ):
+                    logger.info(
+                        f"Retrying streaming mention reply for message={message.id} "
+                        "due to likely stale or assistant-style response."
+                    )
+                    if reply_msg is not None:
+                        try:
+                            await reply_msg.delete()
+                        except Exception:
+                            pass
+                    reply_msg, response = await self._streaming_mention_turn(
+                        message,
+                        question,
+                        target_user_ids or None,
+                        retry_hint=(
+                            "Answer only the latest message. Keep it brief and in character. "
+                            "If ambiguous, ask one short clarifying question."
+                        ),
+                    )
+                r = response.strip()
+                if self._mention_reply_is_failure(question, r):
+                    await self._react_to_failed_llm_response(message)
+                    if reply_msg is not None:
+                        try:
+                            await reply_msg.delete()
+                        except Exception:
+                            pass
+                    return
+                return
+
+            if stream_ok and reply_msg is not None:
+                try:
+                    await reply_msg.delete()
+                except Exception:
+                    pass
+
         async with message.channel.typing():
             response = await genai.client.answer_message_question(
                 message, question, target_user_ids or None
             )
-            response = self._strip_transcript_format(response)
-            response = re.sub(r"^sigrok:\s*", "", response, flags=re.IGNORECASE).strip()
-            response = self._strip_bot_mention(response)
-            response = self._normalize_bot_response(response)
-            if not has_images and self._response_needs_retry(question, response, is_reply_chain=is_reply_chain):
-                logger.info(
-                    f"Retrying mention reply for message={message.id} due to likely stale or assistant-style response."
-                )
+        response = self._post_process_mention_reply(response)
+        if not has_images and self._response_needs_retry(
+            question, response, is_reply_chain=is_reply_chain
+        ):
+            logger.info(
+                f"Retrying mention reply for message={message.id} due to likely stale or assistant-style response."
+            )
+            async with message.channel.typing():
                 response = await genai.client.answer_message_question(
                     message,
                     question,
@@ -356,48 +554,161 @@ class Misc(commands.Cog):
                         "If ambiguous, ask one short clarifying question."
                     ),
                 )
-                response = self._strip_transcript_format(response)
-                response = re.sub(r"^sigrok:\s*", "", response, flags=re.IGNORECASE).strip()
-                response = self._strip_bot_mention(response)
-                response = self._normalize_bot_response(response)
-            r = response.strip()
-            if (
-                not r
-                or r.lower() == question.lower().strip()
-                or (len(r) < 200 and r in SIGROK_PERSONALITY_SYSTEM_PROMPT)
-                or r in {"not worth my time", "I couldn't answer that right now."}
-            ):
-                await self._react_to_failed_llm_response(message)
-                return
-            await self._send_response_to_ping(message, response)
+            response = self._post_process_mention_reply(response)
+        r = response.strip()
+        if self._mention_reply_is_failure(question, r):
+            await self._react_to_failed_llm_response(message)
+            return
+        await self._send_response_to_ping(message, response)
 
-    async def _handle_respect_scoring(self, message: Message) -> None:
-        if not self._should_score_message(message):
+    async def run_deferred_mention_reply(
+        self,
+        message: Message,
+        question: str,
+        *,
+        history_before: Optional[datetime] = None,
+    ) -> None:
+        """
+        Run the normal @Sigrok genai reply using a stored prompt (for ConditionalPosts jobs).
+        The bot reply is still threaded to the original schedule message (Discord reference).
+
+        Transcript cutoff: if history_before is omitted, uses current time UTC so the SLM sees
+        recent channel activity at fire time. Passing history_before overrides that.
+        Context is capped to a few recent human turns; reply-chain ancestors are not merged in.
+        """
+        has_images = genai.client._message_has_images(message)
+        if (
+            not has_images
+            and message.reference
+            and message.reference.message_id is not None
+        ):
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+                has_images = genai.client._message_has_images(ref)
+            except Exception:
+                pass
+
+        if not question.strip():
+            async with message.channel.typing():
+                await self._send_response_to_ping(message, "Ask me something after the ping.")
             return
 
-        assert message.guild is not None
-        cooldown_key = (message.guild.id, message.author.id)
-        delta, reason = await genai.client.score_message_respect(message)
-        self.respect_cooldowns[cooldown_key] = message.created_at
-
-        if delta == 0:
-            logger.info(
-                f"No IQ change for {message.author.name} ({message.author.id}): {reason}"
-            )
-            return
-
-        updated_user = await db.adjust_user_iq(message.guild.id, message.author.id, delta)
-        logger.info(
-            f"Adjusted IQ for {message.author.name} ({message.author.id}) by {delta}. "
-            f"New IQ: {updated_user.iq}. Reason: {reason}"
+        llm_question = self._deferred_self_post_llm_prompt(question)
+        effective_history_before = (
+            history_before if history_before is not None else datetime.now(timezone.utc)
         )
+
+        target_user_ids = self._extract_target_user_ids(message, question)
+        target_user_ids = target_user_ids | {message.author.id}
+        is_reply_chain = bool(message.reference and message.reference.message_id)
+        if not has_images and is_reply_chain:
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+                has_images = genai.client._message_has_images(ref)
+            except Exception:
+                pass
+
+        stream_ok = self._mention_streaming_eligible(has_images)
+        reply_msg: Optional[Message] = None
+        response = ""
+
+        if stream_ok:
+            typing_ctx = message.channel.typing()
+            await typing_ctx.__aenter__()
+            try:
+                reply_msg, response = await self._streaming_mention_turn(
+                    message,
+                    llm_question,
+                    target_user_ids or None,
+                    retry_hint=None,
+                    typing_ctx=typing_ctx,
+                    history_before=effective_history_before,
+                    recent_context_human_turns=self._DEFERRED_SCHEDULE_RECENT_HUMAN_TURNS,
+                    merge_reply_chain=False,
+                )
+            except RuntimeError as exc:
+                logger.warning(f"Mention streaming unavailable ({exc}); falling back.")
+                try:
+                    await typing_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                stream_ok = False
+
+            if stream_ok and response and not self._mention_reply_is_failure(llm_question, response):
+                if not has_images and self._response_needs_retry(
+                    llm_question, response, is_reply_chain=is_reply_chain
+                ):
+                    logger.info(
+                        f"Retrying streaming mention reply for message={message.id} "
+                        "due to likely stale or assistant-style response."
+                    )
+                    if reply_msg is not None:
+                        try:
+                            await reply_msg.delete()
+                        except Exception:
+                            pass
+                    reply_msg, response = await self._streaming_mention_turn(
+                        message,
+                        llm_question,
+                        target_user_ids or None,
+                        retry_hint=None,
+                        history_before=effective_history_before,
+                        recent_context_human_turns=self._DEFERRED_SCHEDULE_RECENT_HUMAN_TURNS,
+                        merge_reply_chain=False,
+                    )
+                r = response.strip()
+                if self._mention_reply_is_failure(llm_question, r):
+                    await self._react_to_failed_llm_response(message)
+                    if reply_msg is not None:
+                        try:
+                            await reply_msg.delete()
+                        except Exception:
+                            pass
+                    return
+                return
+
+            if stream_ok and reply_msg is not None:
+                try:
+                    await reply_msg.delete()
+                except Exception:
+                    pass
+
+        async with message.channel.typing():
+            response = await genai.client.answer_message_question(
+                message,
+                llm_question,
+                target_user_ids or None,
+                history_before=effective_history_before,
+                recent_context_human_turns=self._DEFERRED_SCHEDULE_RECENT_HUMAN_TURNS,
+                merge_reply_chain=False,
+            )
+        response = self._post_process_mention_reply(response)
+        if not has_images and self._response_needs_retry(
+            llm_question, response, is_reply_chain=is_reply_chain
+        ):
+            logger.info(
+                f"Retrying mention reply for message={message.id} due to likely stale or assistant-style response."
+            )
+            async with message.channel.typing():
+                response = await genai.client.answer_message_question(
+                    message,
+                    llm_question,
+                    target_user_ids or None,
+                    retry_hint=None,
+                    history_before=effective_history_before,
+                    recent_context_human_turns=self._DEFERRED_SCHEDULE_RECENT_HUMAN_TURNS,
+                    merge_reply_chain=False,
+                )
+            response = self._post_process_mention_reply(response)
+        r = response.strip()
+        if self._mention_reply_is_failure(llm_question, r):
+            await self._react_to_failed_llm_response(message)
+            return
+        await self._send_response_to_ping(message, response)
 
     @commands.Cog.listener()
     async def on_message(self, message: Message) -> None:
         try:
-            if await self._auto_accept_iq_bot_bet(message):
-                return
-
             if message.author.bot:
                 return
 
@@ -427,8 +738,6 @@ class Misc(commands.Cog):
             if not channel_whitelisted:
                 return
 
-            # IQ changes now come from hidden modifiers emitted during model-driven
-            # reply/judgement flows, rather than a separate score call on every message.
             return
         except Exception as exc:
             logger.exception(f"Unhandled error in on_message: {exc}")

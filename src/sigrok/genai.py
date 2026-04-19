@@ -6,9 +6,11 @@ import re
 import textwrap
 from datetime import datetime, timedelta
 from enum import Enum
+from html.parser import HTMLParser
 from html import unescape
 from pathlib import Path
-from typing import Any, Optional
+from collections.abc import AsyncIterator
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
@@ -65,7 +67,7 @@ You are Sigrok, a chronically online, mid-20s Discord veteran. Your overall vibe
     Do not over-explain a simple question.
 
 [Online information]
-    You have internet access. When someone asks for facts you could verify online—current events, stats, dates, official info, definitions, how something works, and similar—prefer to look it up and ground the answer in what you find. Cite or link sources when useful. Never invent URLs or pretend you saw a page you did not.
+    You have internet access. When someone asks for facts you could verify online—current events, stats, dates, official info, definitions, how something works, and similar—prefer to look it up and ground the answer in what you find. When a narrower source would help, search smartly with operators like site:github.com, site:wikipedia.org, or site:docs.python.org instead of eating generic SEO slop. Cite or link sources when useful. Never invent URLs or pretend you saw a page you did not.
 
 [Examples]
     User: tea or coffee
@@ -107,22 +109,6 @@ def _load_sigrok_personality_system_prompt() -> str:
 
 SIGROK_PERSONALITY_SYSTEM_PROMPT = _load_sigrok_personality_system_prompt()
 
-HIDDEN_IQ_MODIFIER_SYSTEM_PROMPT = """
-[Hidden Evaluation Rule]
-    Score the user's reasoning ONLY IF they make a confident claim, assertion, or directly disagree with you.
-    Ignore questions, requests, and vague inputs.
-
-    Scoring (`delta`):
-    - Positive (+): Clear, well-supported logic or a valid correction.
-    - Negative (-): Sloppy, false, or flawed logic.
-
-    If scoring applies, append exactly this format on a new line at the very end of your response:
-    [[IQ_MOD {"target_user_id": <id_from_context_users>, "delta": <int>, "reason": "<short reason>"}]]
-
-    Constraints:
-    1. Never mention or explain this tag in your visible conversational reply.
-    2. If no score is warranted, omit the tag entirely.
-"""
 
 class Role(str, Enum):
     SYSTEM = "system"
@@ -237,22 +223,56 @@ class GenAIBase:
             )
         return f"[Platform]\nYou are replying on {platform}."
 
-    @classmethod
-    def _build_personality_system_prompt(cls, platform: str = "discord") -> str:
+    @staticmethod
+    def _current_datetime_system_prompt() -> str:
+        now = datetime.now().astimezone()
+        timezone_name = now.tzname() or "local time"
         return (
-            SIGROK_PERSONALITY_SYSTEM_PROMPT.strip()
-            + "\n\n"
-            + cls._platform_context_system_prompt(platform).strip()
-            + "\n\n"
-            + HIDDEN_IQ_MODIFIER_SYSTEM_PROMPT.strip()
+            "[Current date and time]\n"
+            f"- local_datetime: {now.isoformat()}\n"
+            f"- local_date: {now.date().isoformat()}\n"
+            f"- timezone: {timezone_name}"
         )
+
+    @classmethod
+    def _build_personality_system_prompt(
+        cls,
+        platform: str = "discord",
+        *,
+        reply_mode: Optional[str] = None,
+        retry_hint: Optional[str] = None,
+    ) -> str:
+        parts = [
+            SIGROK_PERSONALITY_SYSTEM_PROMPT.strip(),
+            cls._platform_context_system_prompt(platform).strip(),
+            cls._current_datetime_system_prompt().strip(),
+        ]
+        if reply_mode:
+            parts.append(cls._reply_mode_system_block(reply_mode, retry_hint))
+        return "\n\n".join(parts)
+
+    @classmethod
+    def _reply_mode_system_block(cls, reply_mode: str, retry_hint: Optional[str] = None) -> str:
+        lines = [
+            "[Reply instructions]",
+            f"- {cls._mention_length_hint(reply_mode)}",
+            "- reply to the latest message, not the strongest earlier tangent",
+            "- sound like sigrok, not an assistant",
+        ]
+        if reply_mode == "ambiguous_followup":
+            lines.append("- if ambiguous, ask one short clarifying question")
+        if reply_mode == "reply_chain":
+            lines.append("- resolve this/that/it/better against the reply chain first")
+        if retry_hint:
+            lines.append(f"- retry hint: {retry_hint}")
+        return "\n".join(lines)
 
     @staticmethod
     def _json_dumps(payload: dict[str, Any]) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _build_context_users(
-        self, messages: list[Message], iq_by_user: Optional[dict[int, int]] = None
+        self, messages: list[Message], rating_by_user: Optional[dict[int, int]] = None
     ) -> list[dict[str, Any]]:
         context_users: dict[int, dict[str, Any]] = {}
 
@@ -267,8 +287,8 @@ class GenAIBase:
                 existing["name"] = name
             if display_name:
                 existing["display_name"] = display_name
-            if iq_by_user is not None and user_id in iq_by_user:
-                existing["iq"] = iq_by_user[user_id]
+            if rating_by_user is not None and user_id in rating_by_user:
+                existing["rating"] = rating_by_user[user_id]
             context_users[user_id] = existing
 
         for message in messages:
@@ -279,53 +299,27 @@ class GenAIBase:
         return list(context_users.values())
 
     @staticmethod
-    def _format_iq_reference_note(
-        context_users: list[dict[str, Any]], iq_by_user: dict[int, int]
+    def _format_rating_reference_note(
+        context_users: list[dict[str, Any]], rating_by_user: dict[int, int]
     ) -> str:
         entries: list[str] = []
         for user in context_users:
             user_id = user.get("user_id")
-            if not isinstance(user_id, int) or user_id not in iq_by_user:
+            if not isinstance(user_id, int) or user_id not in rating_by_user:
                 continue
             label = (
                 str(user.get("display_name") or "").strip()
                 or str(user.get("name") or "").strip()
                 or f"user_{user_id}"
             )
-            entries.append(f"{label}={iq_by_user[user_id]}")
+            entries.append(f"{label}={rating_by_user[user_id]}")
 
         if not entries:
             return ""
         return (
-            "IQ reference only (not part of the conversation, do not quote it unless directly asked): "
+            "Rating reference only (not part of the conversation, do not quote it unless directly asked): "
             + ", ".join(entries)
         )
-
-    @classmethod
-    def _build_mention_reply_tail(
-        cls,
-        reply_mode: str,
-        retry_hint: Optional[str] = None,
-        reply_chain_tail: str = "",
-    ) -> str:
-        lines: list[str] = []
-        if reply_chain_tail:
-            lines.append(reply_chain_tail)
-        lines.extend(
-            [
-                "[How to reply]",
-                f"- {cls._mention_length_hint(reply_mode)}",
-                "- reply to the latest message, not the strongest earlier tangent",
-                "- sound like sigrok, not an assistant",
-            ]
-        )
-        if reply_mode == "ambiguous_followup":
-            lines.append("- if ambiguous, ask one short clarifying question")
-        if reply_mode == "reply_chain":
-            lines.append("- resolve this/that/it/better against the reply chain first")
-        if retry_hint:
-            lines.append(f"- retry hint: {retry_hint}")
-        return "\n".join(lines)
 
     def _social_message_excerpt(
         self, message: dict[str, Any], max_chars: int = 140
@@ -462,18 +456,10 @@ class GenAIBase:
                 },
             }
         )
-        return "\n\n".join(
-            part
-            for part in (
-                payload_body,
-                self._build_mention_reply_tail(
-                    resolved_reply_mode,
-                    retry_hint,
-                    reply_chain_tail=reply_chain_tail,
-                ),
-            )
-            if part
-        )
+        payload_parts = [payload_body]
+        if reply_chain_tail:
+            payload_parts.append(reply_chain_tail)
+        return "\n\n".join(part for part in payload_parts if part)
 
     def _message_excerpt(self, message: Message, max_chars: int = 140) -> str:
         text = self._message_content(message)
@@ -482,126 +468,166 @@ class GenAIBase:
             return text[: max_chars - 3].rstrip() + "..."
         return text
 
+    @staticmethod
+    def _infer_reply_question_scope(question: str) -> str:
+        lowered = question.lower()
+        if any(word in lowered for word in ("image", "picture", "photo", "screenshot", "meme")):
+            return "describe_image"
+        if any(word in lowered for word in ("person", "guy", "girl", "man", "woman", "he ", "she ")):
+            return "describe_person"
+        if any(word in lowered for word in ("funny", "unfunny", "joke", "humor", "humour")):
+            return "judge_humor"
+        return "reply_to_latest_message"
+
+    def _find_image_source_message(
+        self, current_message: Message, ancestors: list[Message]
+    ) -> Optional[Message]:
+        if self._message_has_images(current_message):
+            return current_message
+        for candidate in reversed(ancestors):
+            if self._message_has_images(candidate):
+                return candidate
+        return None
+
+    def _message_focus_payload(
+        self,
+        message: Message,
+        image_indexes: Optional[dict[tuple[int, int], int]] = None,
+    ) -> dict[str, Any]:
+        payload = self._message_payload(message, image_indexes)
+        return {
+            "id": payload["id"],
+            "author_id": payload["author_id"],
+            "author_name": payload["author_name"],
+            "author_display_name": payload["author_display_name"],
+            "author_is_bot": payload["author_is_bot"],
+            "reply_to_message_id": payload["reply_to_message_id"],
+            "content": payload["content"],
+            "content_excerpt": self._message_excerpt(message),
+            "has_images": self._message_has_images(message),
+            "attachments": payload["attachments"],
+        }
+
+    def _surrounding_image_payload(
+        self,
+        message: Message,
+        image_indexes: Optional[dict[tuple[int, int], int]] = None,
+    ) -> Optional[dict[str, Any]]:
+        if image_indexes is None:
+            return None
+
+        images: list[dict[str, Any]] = []
+        for attachment_idx, attachment in enumerate(message.attachments):
+            vision_input_index = image_indexes.get((message.id, attachment_idx))
+            if vision_input_index is None:
+                continue
+            images.append(
+                {
+                    "filename": attachment.filename,
+                    "vision_input_index": vision_input_index,
+                }
+            )
+
+        for embed_idx, embed in enumerate(message.embeds):
+            vision_input_index = image_indexes.get((message.id, len(message.attachments) + embed_idx))
+            if vision_input_index is None:
+                continue
+            images.append(
+                {
+                    "filename": getattr(embed, "title", None)
+                    or getattr(embed, "url", None)
+                    or "embed_image",
+                    "vision_input_index": vision_input_index,
+                }
+            )
+
+        if not images:
+            return None
+
+        return {
+            "message_id": message.id,
+            "speaker": getattr(message.author, "display_name", None) or self._speaker_label(message),
+            "content_excerpt": self._message_excerpt(message),
+            "images": images,
+        }
+
+    def _render_surrounding_image_payloads(
+        self,
+        messages: list[Message],
+        image_indexes: Optional[dict[tuple[int, int], int]] = None,
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        remaining_tokens = self.available_tokens("")
+        for message in reversed(messages):
+            payload = self._surrounding_image_payload(message, image_indexes)
+            if payload is None:
+                continue
+            payload_tokens = self.count_tokens(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            )
+            if remaining_tokens - payload_tokens < 0:
+                logger.warning("Not enough tokens available for the surrounding image payload.")
+                continue
+            remaining_tokens -= payload_tokens
+            payloads.append(payload)
+        return list(reversed(payloads))
+
     async def _build_reply_chain_focus(
         self,
         source_message: Message,
         bot_user_id: Optional[int],
         user_ids: Optional[set[int]],
         image_indexes: Optional[dict[tuple[int, int], int]] = None,
+        *,
+        question: Optional[str] = None,
     ) -> tuple[list[Message], Optional[dict[str, Any]], str]:
         if not source_message.reference or source_message.reference.message_id is None:
             return [], None, ""
 
-        ancestors = await self._collect_reference_chain_messages(
-            source_message, bot_user_id, user_ids
-        )
-        if not ancestors:
+        parent_message = await self._resolve_reference_message(source_message)
+        if parent_message is None:
+            return [], None, ""
+        if not self._eligible_for_transcript(
+            parent_message, bot_user_id, user_ids, skip_user_id_filter=True
+        ):
             return [], None, ""
 
-        chain_messages = list(ancestors)
+        chain_messages = [parent_message]
         if not source_message.author.bot:
             chain_messages.append(source_message)
 
-        parent_message = ancestors[-1]
         current_message = source_message
+        image_source_message = self._find_image_source_message(
+            current_message, [parent_message]
+        )
+        question_scope = self._infer_reply_question_scope(question or current_message.content or "")
         payload = {
             "focus": "primary",
-            "reason": "This is a reply-chain turn. Prioritize the chain over nearby channel chatter.",
-            "messages": [
-                self._message_payload(message, image_indexes) for message in chain_messages
-            ],
+            "reason": "This is a reply-chain turn. Answer the latest message using only the direct parent reply target.",
+            "question_scope": question_scope,
+            "current_message": self._message_focus_payload(current_message, image_indexes),
+            "direct_parent_message": self._message_focus_payload(parent_message, image_indexes),
+            "image_source_message": (
+                self._message_focus_payload(image_source_message, image_indexes)
+                if image_source_message is not None
+                else None
+            ),
+            "reply_chain_transcript": self._render_plain_context_messages(chain_messages),
         }
-        tail = "\n".join(
-            [
-                "[Reply chain focus]",
-                "- this reply chain is the primary context",
-                f"- direct parent from {self._speaker_label(parent_message)}: {self._message_excerpt(parent_message)}",
-                f"- current message from {self._speaker_label(current_message)}: {self._message_excerpt(current_message)}",
-            ]
-        )
-        return chain_messages, payload, tail
-
-    @staticmethod
-    def _context_user_ids(context_users: list[dict[str, Any]]) -> set[int]:
-        ids: set[int] = set()
-        for user in context_users:
-            user_id = user.get("user_id")
-            if isinstance(user_id, int):
-                ids.add(user_id)
-        return ids
-
-    def _extract_hidden_iq_modifier(
-        self, response: str, valid_target_user_ids: Optional[set[int]] = None
-    ) -> tuple[str, Optional[dict[str, Any]]]:
-        match = re.search(r"\[\[IQ_MOD\s*(\{.*?\})\s*\]\]", response, flags=re.DOTALL)
-        if match is None:
-            return response, None
-
-        payload_text = match.group(1).strip()
-        before = response[: match.start()].rstrip()
-        after = response[match.end() :].lstrip()
-        visible_response = "\n\n".join(part for part in (before, after) if part).strip()
-        try:
-            parsed = json.loads(payload_text)
-        except json.JSONDecodeError as exc:
-            logger.warning(f"Failed to parse hidden IQ modifier: {exc}")
-            return visible_response or response, None
-
-        if not isinstance(parsed, dict):
-            logger.warning(f"Hidden IQ modifier was not an object: {parsed!r}")
-            return visible_response or response, None
-
-        target_user_id = parsed.get("target_user_id")
-        delta = parsed.get("delta")
-        reason = str(parsed.get("reason") or "").strip()
-
-        if not isinstance(target_user_id, int):
-            logger.warning(f"Hidden IQ modifier had invalid target_user_id: {parsed!r}")
-            return visible_response or response, None
-        if not isinstance(delta, int):
-            logger.warning(f"Hidden IQ modifier had invalid delta: {parsed!r}")
-            return visible_response or response, None
-        if not reason:
-            logger.warning("Hidden IQ modifier omitted reason.")
-            return visible_response or response, None
-        if valid_target_user_ids is not None and target_user_id not in valid_target_user_ids:
-            logger.warning(
-                f"Hidden IQ modifier targeted unknown user {target_user_id}: {parsed!r}"
+        tail_lines = [
+            "[Reply chain focus]",
+            "- this reply chain is the primary context",
+            f"- current message from {self._speaker_label(current_message)}: {self._message_excerpt(current_message)}",
+            f"- direct parent from {self._speaker_label(parent_message)}: {self._message_excerpt(parent_message)}",
+        ]
+        if image_source_message is not None:
+            tail_lines.append(
+                f"- primary visual source from {self._speaker_label(image_source_message)}: "
+                f"{self._message_excerpt(image_source_message)}"
             )
-            return visible_response or response, None
-
-        return visible_response, {
-            "target_user_id": target_user_id,
-            "delta": delta,
-            "reason": reason[:250],
-        }
-
-    async def _apply_hidden_iq_modifier(
-        self, guild_id: Optional[int], modifier: Optional[dict[str, Any]]
-    ) -> None:
-        if guild_id is None or modifier is None:
-            return
-        updated_user = await db.adjust_user_iq(
-            guild_id, modifier["target_user_id"], modifier["delta"]
-        )
-        logger.info(
-            "Applied hidden IQ modifier "
-            f"guild={guild_id} user={modifier['target_user_id']} "
-            f"delta={modifier['delta']} new_iq={updated_user.iq} "
-            f"reason={modifier['reason']}"
-        )
-
-    async def _finalize_visible_response(
-        self,
-        response: str,
-        guild_id: Optional[int],
-        valid_target_user_ids: Optional[set[int]] = None,
-    ) -> str:
-        visible_response, modifier = self._extract_hidden_iq_modifier(
-            response, valid_target_user_ids
-        )
-        await self._apply_hidden_iq_modifier(guild_id, modifier)
-        return visible_response
+        tail_lines.append(f"- question_scope: {question_scope}")
+        tail = "\n".join(tail_lines)
+        return chain_messages, payload, tail
 
     def count_tokens(self, input: str) -> int:
         if self.tokenizer is None:
@@ -889,22 +915,22 @@ class GenAIBase:
 
         return image_indexes, inline_images
 
-    def _speaker_label_with_iq(
-        self, message: Message, iq_by_user: Optional[dict[int, int]] = None
+    def _speaker_label_with_rating(
+        self, message: Message, rating_by_user: Optional[dict[int, int]] = None
     ) -> str:
         speaker = self._speaker_label(message)
-        if iq_by_user is None or message.author.bot:
+        if rating_by_user is None or message.author.bot:
             return speaker
-        iq = iq_by_user.get(message.author.id)
-        if iq is None:
+        r = rating_by_user.get(message.author.id)
+        if r is None:
             return speaker
-        return f"{speaker} (IQ: {iq})"
+        return f"{speaker} (rating: {r})"
 
     def _message_payload(
         self,
         message: Message,
         image_indexes: Optional[dict[tuple[int, int], int]] = None,
-        iq_by_user: Optional[dict[int, int]] = None,
+        rating_by_user: Optional[dict[int, int]] = None,
     ) -> dict[str, Any]:
         attachments = []
         for attachment_idx, attachment in enumerate(message.attachments):
@@ -921,15 +947,15 @@ class GenAIBase:
                     attachment_payload["vision_input_index"] = vision_input_index
             attachments.append(attachment_payload)
         display_name = getattr(message.author, "display_name", None)
-        author_iq = None
-        if iq_by_user is not None and not message.author.bot:
-            author_iq = iq_by_user.get(message.author.id)
+        author_rating = None
+        if rating_by_user is not None and not message.author.bot:
+            author_rating = rating_by_user.get(message.author.id)
         return {
             "id": message.id,
             "author_id": message.author.id,
             "author_name": self._speaker_label(message),
             "author_display_name": display_name,
-            "author_iq": author_iq,
+            "author_rating": author_rating,
             "author_is_bot": bool(message.author.bot),
             "created_at": message.created_at.isoformat(),
             "reply_to_message_id": (
@@ -942,7 +968,7 @@ class GenAIBase:
         }
 
     def format_message(
-        self, message: Message, iq_by_user: Optional[dict[int, int]] = None
+        self, message: Message, rating_by_user: Optional[dict[int, int]] = None
     ) -> str:
         content = self._message_content(message)
         if message.attachments:
@@ -950,19 +976,42 @@ class GenAIBase:
                 attachment.filename for attachment in message.attachments
             )
             content = f"{content} [attachments: {attachment_names}]"
-        speaker = self._speaker_label_with_iq(message, iq_by_user)
+        speaker = self._speaker_label_with_rating(message, rating_by_user)
+        return f"{speaker}: {content}"
+
+    def _format_plain_context_message(self, message: Message) -> str:
+        content = self._message_content(message)
+        if message.attachments:
+            attachment_names = ", ".join(
+                attachment.filename for attachment in message.attachments
+            )
+            content = f"{content} [attachments: {attachment_names}]"
+        speaker = getattr(message.author, "display_name", None) or self._speaker_label(message)
         return f"{speaker}: {content}"
 
     def _render_messages(
-        self, messages: list[Message], iq_by_user: Optional[dict[int, int]] = None
+        self, messages: list[Message], rating_by_user: Optional[dict[int, int]] = None
     ) -> str:
         lines: list[str] = []
         remaining_tokens = self.available_tokens("")
         for message in reversed(messages):
-            formatted_message = self.format_message(message, iq_by_user)
+            formatted_message = self.format_message(message, rating_by_user)
             message_tokens = self.count_tokens(formatted_message)
             if remaining_tokens - message_tokens < 0:
                 logger.warning("Not enough tokens available for the message.")
+                continue
+            remaining_tokens -= message_tokens
+            lines.append(formatted_message)
+        return "\n".join(reversed(lines))
+
+    def _render_plain_context_messages(self, messages: list[Message]) -> str:
+        lines: list[str] = []
+        remaining_tokens = self.available_tokens("")
+        for message in reversed(messages):
+            formatted_message = self._format_plain_context_message(message)
+            message_tokens = self.count_tokens(formatted_message)
+            if remaining_tokens - message_tokens < 0:
+                logger.warning("Not enough tokens available for the plain context message.")
                 continue
             remaining_tokens -= message_tokens
             lines.append(formatted_message)
@@ -972,12 +1021,12 @@ class GenAIBase:
         self,
         messages: list[Message],
         image_indexes: Optional[dict[tuple[int, int], int]] = None,
-        iq_by_user: Optional[dict[int, int]] = None,
+        rating_by_user: Optional[dict[int, int]] = None,
     ) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
         remaining_tokens = self.available_tokens("")
         for message in reversed(messages):
-            payload = self._message_payload(message, image_indexes, iq_by_user)
+            payload = self._message_payload(message, image_indexes, rating_by_user)
             payload_tokens = self.count_tokens(
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             )
@@ -1051,22 +1100,26 @@ class GenAIBase:
             logger.debug(f"Unable to resolve reply reference {message.reference.message_id}: {exc}")
             return None
 
+    _MAX_REPLY_CHAIN_DEPTH = 6
+
     async def _collect_reference_chain_messages(
         self,
         source_message: Message,
         bot_user_id: Optional[int],
         user_ids: Optional[set[int]] = None,
     ) -> list[Message]:
-        """Walk the entire reply chain so mention replies keep full ancestor context."""
+        """Walk the reply chain up to _MAX_REPLY_CHAIN_DEPTH eligible ancestors."""
         chain: list[Message] = []
         seen_ids: set[int] = {source_message.id}
         current = source_message
+        hops = 0
 
-        while True:
+        while len(chain) < self._MAX_REPLY_CHAIN_DEPTH and hops < self._MAX_REPLY_CHAIN_DEPTH * 3:
             ref = await self._resolve_reference_message(current)
             if ref is None or ref.id in seen_ids:
                 break
             seen_ids.add(ref.id)
+            hops += 1
             if self._eligible_for_transcript(
                 ref, bot_user_id, user_ids, skip_user_id_filter=True
             ):
@@ -1098,15 +1151,21 @@ class GenAIBase:
         limit: int,
         user_ids: Optional[set[int]] = None,
         include_current: bool = False,
+        history_before: Optional[datetime] = None,
+        *,
+        merge_reply_chain: bool = True,
     ) -> list[Message]:
         """Build transcript: last `limit` human turns plus interleaved Sigrok replies (chronological)."""
         guild = source_message.guild
         bot_user_id: Optional[int] = guild.me.id if guild and guild.me else None
 
         raw: list[Message] = []
-        history_limit = max(limit * 15, 80)
+        history_limit = max(limit * 3, 20)
+        before_anchor = (
+            history_before if history_before is not None else source_message.created_at
+        )
         async for message in source_message.channel.history(
-            before=source_message.created_at,
+            before=before_anchor,
             limit=history_limit,
             oldest_first=False,
         ):
@@ -1132,11 +1191,12 @@ class GenAIBase:
 
         # User hit Reply on a message — include the full ancestor chain so "this"
         # / "that" stays grounded even in long Discord reply threads.
-        for ref in await self._collect_reference_chain_messages(
-            source_message, bot_user_id, user_ids
-        ):
-            if ref.id not in by_id:
-                by_id[ref.id] = ref
+        if merge_reply_chain:
+            for ref in await self._collect_reference_chain_messages(
+                source_message, bot_user_id, user_ids
+            ):
+                if ref.id not in by_id:
+                    by_id[ref.id] = ref
 
         merged = sorted(by_id.values(), key=lambda m: (m.created_at, m.id))
 
@@ -1144,17 +1204,6 @@ class GenAIBase:
             merged.append(source_message)
 
         return merged
-
-    def _parse_respect_response(self, response: str) -> tuple[int, str]:
-        delta_match = re.search(r"DELTA:\s*(-?1|0|1)\b", response, flags=re.IGNORECASE)
-        reason_match = re.search(r"REASON:\s*(.+)", response, flags=re.IGNORECASE | re.DOTALL)
-        if delta_match is None:
-            return 0, "Model response did not contain a valid delta."
-        delta = int(delta_match.group(1))
-        delta = max(-self.settings.genai.respect.max_delta_per_message, delta)
-        delta = min(self.settings.genai.respect.max_delta_per_message, delta)
-        reason = reason_match.group(1).strip() if reason_match else "No reason provided."
-        return delta, reason[:250]
 
     async def read_context(self, ctx: ApplicationContext | Reaction | Message) -> str:
         if isinstance(ctx, ApplicationContext):
@@ -1234,7 +1283,7 @@ class GenAIBase:
         event: dict[str, Any],
         response: dict[str, Any],
         context_users: Optional[list[dict[str, Any]]] = None,
-        iq_by_user: Optional[dict[int, int]] = None,
+        rating_by_user: Optional[dict[int, int]] = None,
     ) -> tuple[str, list[str]]:
         image_indexes, inline_images = await self._collect_inline_images(messages)
         return self._json_dumps(
@@ -1243,7 +1292,7 @@ class GenAIBase:
                 "event": {"type": event_type, **event},
                 "context_users": context_users or self._build_context_users(messages),
                 "messages": self._render_message_payloads(
-                    messages, image_indexes, iq_by_user
+                    messages, image_indexes, rating_by_user
                 ),
                 "response": response,
             }
@@ -1258,48 +1307,83 @@ class GenAIBase:
         *,
         reply_mode: Optional[str] = None,
         retry_hint: Optional[str] = None,
-    ) -> tuple[str, list[str], set[int]]:
+        skip_images: bool = False,
+    ) -> tuple[str, list[str], str]:
         image_source_messages = list(messages)
         if all(existing.id != message.id for existing in image_source_messages):
             image_source_messages.append(message)
         bot_user_id: Optional[int] = (
             message.guild.me.id if message.guild and message.guild.me else None
         )
-        ref = await self._resolve_reference_message(message)
-        if ref is not None and ref.attachments and ref.id not in {m.id for m in image_source_messages}:
-            image_source_messages.append(ref)
-        high_detail_message_ids = {message.id}
-        if ref is not None:
-            high_detail_message_ids.add(ref.id)
-        image_indexes, inline_images = await self._collect_inline_images(
-            image_source_messages,
-            high_detail_message_ids=high_detail_message_ids,
-        )
-        iq_by_user = await self._build_guild_iq_map(message)
-        context_users = self._build_context_users(image_source_messages)
-        iq_reference_note = self._format_iq_reference_note(context_users, iq_by_user)
+        if skip_images:
+            ref = None
+            image_indexes: dict[tuple[int, int], int] = {}
+            inline_images: list[str] = []
+        else:
+            ref = await self._resolve_reference_message(message)
+            if (
+                ref is not None
+                and self._message_has_images(ref)
+                and ref.id not in {m.id for m in image_source_messages}
+            ):
+                image_source_messages.append(ref)
+            high_detail_message_ids = {message.id}
+            if ref is not None:
+                high_detail_message_ids.add(ref.id)
+            image_indexes, inline_images = await self._collect_inline_images(
+                image_source_messages,
+                high_detail_message_ids=high_detail_message_ids,
+            )
         resolved_reply_mode = reply_mode or self._classify_mention_reply_mode(
             question,
             has_reference=bool(message.reference and message.reference.message_id),
             retry_hint=retry_hint,
         )
-        _, reply_chain_payload, reply_chain_tail = await self._build_reply_chain_focus(
-            message, bot_user_id, user_ids, image_indexes
+        chain_messages, reply_chain_payload, reply_chain_tail = await self._build_reply_chain_focus(
+            message,
+            bot_user_id,
+            user_ids,
+            image_indexes,
+            question=question,
+        )
+        if resolved_reply_mode == "reply_chain" and chain_messages:
+            focus_messages = list(chain_messages)
+        else:
+            focus_messages = [message]
+        focus_message_ids = {m.id for m in focus_messages}
+        surrounding_messages = [m for m in messages if m.id not in focus_message_ids]
+        context_source_messages = list(focus_messages)
+        ambient_messages: list[Message] = []
+        surrounding_transcript = self._render_plain_context_messages(surrounding_messages)
+        surrounding_image_context = self._render_surrounding_image_payloads(
+            surrounding_messages, image_indexes
+        )
+        rating_by_user = await self._build_guild_rating_map(message)
+        context_users = self._build_context_users(context_source_messages)
+        rating_reference_note = self._format_rating_reference_note(
+            context_users, rating_by_user
         )
         payload_body = self._json_dumps(
             {
                 "environment": self._build_environment_payload(message),
+                "instructions": [
+                    "Answer current_message. surrounding_transcript is background only.",
+                    "Need fresh info or sources? Call search_web/fetch_url first. Never invent URLs.",
+                ],
                 "event": {
                     "type": "mention_reply",
                     "question": question,
                     "reply_mode": resolved_reply_mode,
-                    "current_message": self._message_payload(message, image_indexes),
+                    "current_message_id": message.id,
                     "target_user_ids": sorted(user_ids) if user_ids else [],
                     "retry_hint": retry_hint,
                 },
                 "context_users": context_users,
-                "messages": self._render_message_payloads(messages, image_indexes),
-                "reply_chain": reply_chain_payload,
+                "current_message": self._message_focus_payload(message, image_indexes),
+                "messages": self._render_message_payloads(ambient_messages, image_indexes),
+                "surrounding_transcript": surrounding_transcript,
+                "surrounding_image_context": surrounding_image_context,
+                "thread_focus": reply_chain_payload,
                 "response": {
                     "kind": "discord_message",
                     "plain_text_only": True,
@@ -1307,76 +1391,25 @@ class GenAIBase:
                 },
             }
         )
-        payload_parts = [
-            payload_body,
-            self._build_mention_reply_tail(
-                resolved_reply_mode,
-                retry_hint,
-                reply_chain_tail=reply_chain_tail,
-            ),
-        ]
-        if iq_reference_note:
-            payload_parts.insert(0, iq_reference_note)
+        payload_parts = [payload_body]
+        if reply_chain_tail:
+            payload_parts.append(reply_chain_tail)
+        if rating_reference_note:
+            payload_parts.insert(0, rating_reference_note)
         payload = "\n\n".join(part for part in payload_parts if part)
-        return payload, inline_images, self._context_user_ids(context_users)
+        return payload, inline_images, resolved_reply_mode
 
-    async def _build_guild_iq_map_from_guild(self, guild: Any) -> dict[int, int]:
+    async def _build_guild_rating_map_from_guild(self, guild: Any) -> dict[int, int]:
         if guild is None:
             return {}
         users = await db.read_present_users(guild.id)
-        return {user.user_id: (user.iq if user.iq is not None else 100) for user in users}
+        return {
+            user.user_id: (user.rating if user.rating is not None else 100)
+            for user in users
+        }
 
-    async def _build_guild_iq_map(self, message: Message) -> dict[int, int]:
-        return await self._build_guild_iq_map_from_guild(message.guild)
-
-    async def _build_respect_payload(
-        self, message: Message, messages: list[Message]
-    ) -> tuple[str, list[str]]:
-        iq_by_user = await self._build_guild_iq_map(message)
-        context_users = self._build_context_users(messages, iq_by_user)
-        return await self._build_event_payload(
-            message,
-            event_type="respect_evaluation",
-            messages=messages,
-            event={
-                "current_message": self._message_payload(
-                    message, iq_by_user=iq_by_user
-                ),
-                "target_author": self._speaker_label(message),
-                "scoring": {
-                    "allowed_deltas": [-1, 0, 1],
-                    "default_delta": 0,
-                    "positive_signals": [
-                        "clear",
-                        "substantive",
-                        "insightful",
-                        "well_reasoned",
-                        "informative",
-                    ],
-                    "negative_signals": [
-                        "dishonest",
-                        "incoherent",
-                        "lazy",
-                        "aggressively_low_quality",
-                    ],
-                    "ignore": [
-                        "ordinary_banter",
-                        "short_acknowledgements",
-                        "memes",
-                        "insufficient_substance",
-                    ],
-                },
-            },
-            response={
-                "kind": "json",
-                "schema": {
-                    "delta": "-1 | 0 | 1",
-                    "reason": "brief string, max 250 chars",
-                },
-            },
-            context_users=context_users,
-            iq_by_user=iq_by_user,
-        )
+    async def _build_guild_rating_map(self, message: Message) -> dict[int, int]:
+        return await self._build_guild_rating_map_from_guild(message.guild)
 
     async def _build_debate_payload(
         self,
@@ -1385,15 +1418,15 @@ class GenAIBase:
         participants: list[str],
         *,
         topic: Optional[str] = None,
-    ) -> tuple[str, list[str], set[int]]:
+    ) -> tuple[str, list[str]]:
         image_source_messages = list(messages)
         if isinstance(ctx, Reaction) and all(
             existing.id != ctx.message.id for existing in image_source_messages
         ):
             image_source_messages.append(ctx.message)
         guild = ctx.message.guild if isinstance(ctx, Reaction) else ctx.guild
-        iq_by_user = await self._build_guild_iq_map_from_guild(guild)
-        context_users = self._build_context_users(image_source_messages, iq_by_user)
+        rating_by_user = await self._build_guild_rating_map_from_guild(guild)
+        context_users = self._build_context_users(image_source_messages, rating_by_user)
         image_indexes, inline_images = await self._collect_inline_images(
             image_source_messages
         )
@@ -1414,14 +1447,14 @@ class GenAIBase:
                         "transcript_claims_must_match_messages": True,
                     },
                     "trigger_message": (
-                        self._message_payload(ctx.message, image_indexes, iq_by_user)
+                        self._message_payload(ctx.message, image_indexes, rating_by_user)
                         if isinstance(ctx, Reaction)
                         else None
                     ),
                 },
                 "context_users": context_users,
                 "messages": self._render_message_payloads(
-                    messages, image_indexes, iq_by_user
+                    messages, image_indexes, rating_by_user
                 ),
                 "response": {
                     "kind": "json",
@@ -1432,7 +1465,7 @@ class GenAIBase:
                 },
             }
         )
-        return payload, inline_images, self._context_user_ids(context_users)
+        return payload, inline_images
 
     @staticmethod
     def _parse_json_response(response: str) -> Optional[dict[str, Any]]:
@@ -1497,6 +1530,10 @@ class GenAIBase:
         question: str,
         user_ids: Optional[set[int]] = None,
         retry_hint: Optional[str] = None,
+        history_before: Optional[datetime] = None,
+        *,
+        recent_context_human_turns: Optional[int] = None,
+        merge_reply_chain: bool = True,
     ) -> str:
         raise NotImplementedError("answer_message_question must be implemented by subclasses")
 
@@ -1520,9 +1557,6 @@ class GenAIBase:
         topic: Optional[str] = None,
     ) -> tuple[str, str]:
         raise NotImplementedError("judge_debate must be implemented by subclasses")
-
-    async def score_message_respect(self, message: Message) -> tuple[int, str]:
-        raise NotImplementedError("score_message_respect must be implemented by subclasses")
 
 
 class GenAIGpt(GenAIBase):
@@ -1574,7 +1608,7 @@ class GenAIGpt(GenAIBase):
             logger.warning("No conversation history found.")
             return "error", "No conversation history available to judge."
 
-        user_payload, inline_images, valid_target_user_ids = await self._build_debate_payload(
+        user_payload, inline_images = await self._build_debate_payload(
             ctx, messages_for_context, participants, topic=topic
         )
         try:
@@ -1591,9 +1625,6 @@ class GenAIGpt(GenAIBase):
                     ),
                 ]
             )
-            response = await self._finalize_visible_response(
-                response, getattr(ctx.guild, "id", None), valid_target_user_ids
-            )
             return self._parse_debate_response(response, participants)
         except Exception as exc:
             logger.error(f"Error occurred in judge_debate: {exc}")
@@ -1605,23 +1636,34 @@ class GenAIGpt(GenAIBase):
         question: str,
         user_ids: Optional[set[int]] = None,
         retry_hint: Optional[str] = None,
+        history_before: Optional[datetime] = None,
+        *,
+        recent_context_human_turns: Optional[int] = None,
+        merge_reply_chain: bool = True,
     ) -> str:
         has_reference = bool(message.reference and message.reference.message_id)
         reply_mode = self._classify_mention_reply_mode(
             question, has_reference=has_reference, retry_hint=retry_hint
         )
-        messages_for_context = await self._collect_recent_context_messages(
-            message,
-            self._mention_context_limit(
+        _ctx_limit = (
+            recent_context_human_turns
+            if recent_context_human_turns is not None
+            else self._mention_context_limit(
                 question,
                 settings.genai.question.recent_messages,
                 has_reference=has_reference,
                 retry_hint=retry_hint,
-            ),
+            )
+        )
+        messages_for_context = await self._collect_recent_context_messages(
+            message,
+            _ctx_limit,
             user_ids=user_ids,
             include_current=has_reference,
+            history_before=history_before,
+            merge_reply_chain=merge_reply_chain,
         )
-        user_payload, inline_images, valid_target_user_ids = await self._build_mention_reply_payload(
+        user_payload, inline_images, resolved_reply_mode = await self._build_mention_reply_payload(
             message,
             messages_for_context,
             question,
@@ -1634,7 +1676,9 @@ class GenAIGpt(GenAIBase):
                 [
                     ChatMessage(
                         role=Role.SYSTEM,
-                        content=self._build_personality_system_prompt("discord"),
+                        content=self._build_personality_system_prompt(
+                            "discord", reply_mode=resolved_reply_mode, retry_hint=retry_hint
+                        ),
                     ),
                     ChatMessage(
                         role=Role.USER,
@@ -1643,9 +1687,7 @@ class GenAIGpt(GenAIBase):
                     ),
                 ]
             )
-            return await self._finalize_visible_response(
-                response, getattr(message.guild, "id", None), valid_target_user_ids
-            )
+            return response
         except Exception as exc:
             logger.error(f"Error answering mention question: {exc}")
             return "I couldn't answer that right now."
@@ -1680,7 +1722,9 @@ class GenAIGpt(GenAIBase):
                 [
                     ChatMessage(
                         role=Role.SYSTEM,
-                        content=self._build_personality_system_prompt(platform),
+                        content=self._build_personality_system_prompt(
+                            platform, reply_mode=reply_mode, retry_hint=retry_hint
+                        ),
                     ),
                     ChatMessage(
                         role=Role.USER,
@@ -1688,45 +1732,10 @@ class GenAIGpt(GenAIBase):
                     ),
                 ]
             )
-            return await self._finalize_visible_response(response, None, None)
+            return response
         except Exception as exc:
             logger.error(f"Error answering social question: {exc}")
             return "I couldn't answer that right now."
-
-    async def score_message_respect(self, message: Message) -> tuple[int, str]:
-        messages_for_context = await self._collect_recent_context_messages(
-            message,
-            settings.genai.question.recent_messages,
-            include_current=True,
-        )
-        user_payload, inline_images = await self._build_respect_payload(
-            message, messages_for_context
-        )
-        try:
-            response = self._request_completion(
-                [
-                    ChatMessage(
-                        role=Role.SYSTEM,
-                        content=self._build_personality_system_prompt("discord"),
-                    ),
-                    ChatMessage(
-                        role=Role.USER,
-                        content=user_payload,
-                        images=inline_images or None,
-                    ),
-                ]
-            )
-            parsed = self._parse_json_response(response)
-            if parsed is not None and "delta" in parsed:
-                delta = int(parsed["delta"])
-                delta = max(-self.settings.genai.respect.max_delta_per_message, delta)
-                delta = min(self.settings.genai.respect.max_delta_per_message, delta)
-                reason = str(parsed.get("reason") or "No reason provided.").strip()
-                return delta, reason[:250]
-            return self._parse_respect_response(response)
-        except Exception as exc:
-            logger.error(f"Error scoring respect: {exc}")
-            return 0, "Respect scoring failed."
 
 
 class GenAIAnthropic(GenAIBase):
@@ -1778,7 +1787,7 @@ class GenAIAnthropic(GenAIBase):
             logger.warning("No conversation history found.")
             return "error", "No conversation history available to judge."
 
-        user_payload, inline_images, valid_target_user_ids = await self._build_debate_payload(
+        user_payload, inline_images = await self._build_debate_payload(
             ctx, messages_for_context, participants, topic=topic
         )
         try:
@@ -1792,9 +1801,6 @@ class GenAIAnthropic(GenAIBase):
                 ],
                 self._build_personality_system_prompt("discord"),
             )
-            response = await self._finalize_visible_response(
-                response, getattr(ctx.guild, "id", None), valid_target_user_ids
-            )
             return self._parse_debate_response(response, participants)
         except Exception as exc:
             logger.error(f"Error occurred in judge_debate: {exc}")
@@ -1806,23 +1812,34 @@ class GenAIAnthropic(GenAIBase):
         question: str,
         user_ids: Optional[set[int]] = None,
         retry_hint: Optional[str] = None,
+        history_before: Optional[datetime] = None,
+        *,
+        recent_context_human_turns: Optional[int] = None,
+        merge_reply_chain: bool = True,
     ) -> str:
         has_reference = bool(message.reference and message.reference.message_id)
         reply_mode = self._classify_mention_reply_mode(
             question, has_reference=has_reference, retry_hint=retry_hint
         )
-        messages_for_context = await self._collect_recent_context_messages(
-            message,
-            self._mention_context_limit(
+        _ctx_limit = (
+            recent_context_human_turns
+            if recent_context_human_turns is not None
+            else self._mention_context_limit(
                 question,
                 settings.genai.question.recent_messages,
                 has_reference=has_reference,
                 retry_hint=retry_hint,
-            ),
+            )
+        )
+        messages_for_context = await self._collect_recent_context_messages(
+            message,
+            _ctx_limit,
             user_ids=user_ids,
             include_current=has_reference,
+            history_before=history_before,
+            merge_reply_chain=merge_reply_chain,
         )
-        user_payload, inline_images, valid_target_user_ids = await self._build_mention_reply_payload(
+        user_payload, inline_images, resolved_reply_mode = await self._build_mention_reply_payload(
             message,
             messages_for_context,
             question,
@@ -1839,11 +1856,11 @@ class GenAIAnthropic(GenAIBase):
                         images=inline_images or None,
                     )
                 ],
-                self._build_personality_system_prompt("discord"),
+                self._build_personality_system_prompt(
+                    "discord", reply_mode=resolved_reply_mode, retry_hint=retry_hint
+                ),
             )
-            return await self._finalize_visible_response(
-                response, getattr(message.guild, "id", None), valid_target_user_ids
-            )
+            return response
         except Exception as exc:
             logger.error(f"Error answering mention question: {exc}")
             return "I couldn't answer that right now."
@@ -1881,51 +1898,157 @@ class GenAIAnthropic(GenAIBase):
                         content=user_payload,
                     )
                 ],
-                self._build_personality_system_prompt(platform),
+                self._build_personality_system_prompt(
+                    platform, reply_mode=reply_mode, retry_hint=retry_hint
+                ),
             )
-            return await self._finalize_visible_response(response, None, None)
+            return response
         except Exception as exc:
             logger.error(f"Error answering social question: {exc}")
             return "I couldn't answer that right now."
 
-    async def score_message_respect(self, message: Message) -> tuple[int, str]:
-        messages_for_context = await self._collect_recent_context_messages(
-            message,
-            settings.genai.question.recent_messages,
-            include_current=True,
-        )
-        user_payload, inline_images = await self._build_respect_payload(
-            message, messages_for_context
-        )
-        try:
-            response = self._request_completion(
-                [
-                    ChatMessage(
-                        role=Role.USER,
-                        content=user_payload,
-                        images=inline_images or None,
-                    )
-                ],
-                self._build_personality_system_prompt("discord"),
-            )
-            parsed = self._parse_json_response(response)
-            if parsed is not None and "delta" in parsed:
-                delta = int(parsed["delta"])
-                delta = max(-self.settings.genai.respect.max_delta_per_message, delta)
-                delta = min(self.settings.genai.respect.max_delta_per_message, delta)
-                reason = str(parsed.get("reason") or "No reason provided.").strip()
-                return delta, reason[:250]
-            return self._parse_respect_response(response)
-        except Exception as exc:
-            logger.error(f"Error scoring respect: {exc}")
-            return 0, "Respect scoring failed."
-
 
 class _GenAILocalWithWebTools(GenAIBase):
     tokenizer: None
-    _MAX_TOOL_ROUNDS = 2
+    _MAX_TOOL_ROUNDS = 4
     _MAX_TOOL_CALLS_PER_ROUND = 2
     _MAX_SOURCES_IN_REPLY = 3
+
+    class _HTMLTextExtractor(HTMLParser):
+        _SKIP_TAGS = {"script", "style", "noscript", "nav", "footer", "header", "aside"}
+        _PRIORITY_TAGS = {"main", "article"}
+        _SKIP_ATTR_KEYWORDS = {
+            "nav",
+            "navigation",
+            "sidebar",
+            "footer",
+            "header",
+            "breadcrumb",
+            "breadcrumbs",
+            "toc",
+            "table-of-contents",
+            "menu",
+            "related",
+        }
+        _BLOCK_TAGS = {
+            "article",
+            "blockquote",
+            "br",
+            "dd",
+            "div",
+            "dl",
+            "dt",
+            "figcaption",
+            "figure",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "hr",
+            "li",
+            "main",
+            "ol",
+            "p",
+            "pre",
+            "section",
+            "table",
+            "td",
+            "th",
+            "tr",
+            "ul",
+        }
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self._skip_depth = 0
+            self._skip_stack: list[str] = []
+            self._priority_stack: list[str] = []
+            self._priority_parts: list[str] = []
+            self._fallback_parts: list[str] = []
+
+        def _should_skip_attrs(
+            self, tag: str, attrs: list[tuple[str, Optional[str]]]
+        ) -> bool:
+            if tag in self._PRIORITY_TAGS or not self._priority_stack:
+                return False
+            attr_map = {name.lower(): (value or "") for name, value in attrs}
+            candidates = " ".join(
+                [
+                    attr_map.get("id", ""),
+                    attr_map.get("class", ""),
+                    attr_map.get("role", ""),
+                    attr_map.get("aria-label", ""),
+                ]
+            ).lower()
+            return any(keyword in candidates for keyword in self._SKIP_ATTR_KEYWORDS)
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+            tag = tag.lower()
+            if tag in self._SKIP_TAGS or self._should_skip_attrs(tag, attrs):
+                self._skip_depth += 1
+                self._skip_stack.append(tag)
+                return
+            if self._skip_depth:
+                return
+            if tag in self._PRIORITY_TAGS:
+                self._priority_stack.append(tag)
+            if tag in self._BLOCK_TAGS:
+                self._append_break()
+
+        def handle_startendtag(
+            self, tag: str, attrs: list[tuple[str, Optional[str]]]
+        ) -> None:
+            self.handle_starttag(tag, attrs)
+            self.handle_endtag(tag)
+
+        def handle_endtag(self, tag: str) -> None:
+            tag = tag.lower()
+            if self._skip_depth:
+                if self._skip_stack and tag == self._skip_stack[-1]:
+                    self._skip_stack.pop()
+                    self._skip_depth -= 1
+                return
+            if tag in self._BLOCK_TAGS:
+                self._append_break()
+            if tag in self._PRIORITY_TAGS and self._priority_stack:
+                self._priority_stack.pop()
+
+        def handle_data(self, data: str) -> None:
+            if self._skip_depth:
+                return
+            text = unescape(data)
+            if not text.strip():
+                return
+            target = self._priority_parts if self._priority_stack else self._fallback_parts
+            target.append(text)
+
+        def handle_entityref(self, name: str) -> None:
+            self.handle_data(f"&{name};")
+
+        def handle_charref(self, name: str) -> None:
+            self.handle_data(f"&#{name};")
+
+        def _append_break(self) -> None:
+            target = self._priority_parts if self._priority_stack else self._fallback_parts
+            if not target or target[-1] != "\n":
+                target.append("\n")
+
+        @staticmethod
+        def _collapse(parts: list[str]) -> str:
+            text = "".join(parts)
+            text = text.replace("\r", "\n")
+            text = re.sub(r"[ \t\f\v]+", " ", text)
+            text = re.sub(r" *\n *", "\n", text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            return text.strip()
+
+        def get_text(self) -> str:
+            priority = self._collapse(self._priority_parts)
+            if priority:
+                return priority
+            return self._collapse(self._fallback_parts)
 
     def _extract_answer_from_thinking(self, thinking: str) -> str:
         """When content is empty but thinking exists, try to extract a final answer."""
@@ -1954,7 +2077,6 @@ class _GenAILocalWithWebTools(GenAIBase):
         return lines[-1] if lines else ""
 
     @staticmethod
-    @staticmethod
     def _strip_think_block(content: str) -> str:
         """
         Remove leaked <think>...</think> blocks from visible assistant content.
@@ -1972,6 +2094,61 @@ class _GenAILocalWithWebTools(GenAIBase):
         self.settings = settings
         self.client = None
         self.tokenizer = None
+        self._request_lock = asyncio.Lock()
+        self._queued_local_requests = 0
+
+    async def _run_local_request(self, source: str, runner: Any) -> str:
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
+        self._queued_local_requests += 1
+        queued_behind = max(0, self._queued_local_requests - 1)
+        if queued_behind:
+            logger.info(
+                f"local_request_queued source={source} queued_behind={queued_behind}"
+            )
+        try:
+            async with self._request_lock:
+                wait_ms = int((loop.time() - queued_at) * 1000)
+                logger.info(
+                    f"local_request_start source={source} "
+                    f"queued_behind={queued_behind} wait_ms={wait_ms}"
+                )
+                started_at = loop.time()
+                result = await runner()
+                run_ms = int((loop.time() - started_at) * 1000)
+                logger.info(f"local_request_done source={source} run_ms={run_ms}")
+                return result
+        finally:
+            self._queued_local_requests = max(0, self._queued_local_requests - 1)
+
+    async def _run_local_streaming(
+        self,
+        source: str,
+        stream_factory: Callable[[], AsyncIterator[str]],
+    ) -> AsyncIterator[str]:
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
+        self._queued_local_requests += 1
+        queued_behind = max(0, self._queued_local_requests - 1)
+        if queued_behind:
+            logger.info(
+                f"local_request_queued source={source} queued_behind={queued_behind}"
+            )
+        try:
+            async with self._request_lock:
+                wait_ms = int((loop.time() - queued_at) * 1000)
+                logger.info(
+                    f"local_request_start source={source} "
+                    f"queued_behind={queued_behind} wait_ms={wait_ms}"
+                )
+                started_at = loop.time()
+                stream = stream_factory()
+                async for chunk in stream:
+                    yield chunk
+                run_ms = int((loop.time() - started_at) * 1000)
+                logger.info(f"local_request_done source={source} run_ms={run_ms}")
+        finally:
+            self._queued_local_requests = max(0, self._queued_local_requests - 1)
 
     @staticmethod
     def _normalize_html_text(value: str) -> str:
@@ -1991,34 +2168,90 @@ class _GenAILocalWithWebTools(GenAIBase):
         return href
 
     @classmethod
-    def _parse_duckduckgo_results(
+    def _parse_duckduckgo_lite_results(
         cls, html_text: str, max_results: int
     ) -> list[dict[str, str]]:
-        pattern = re.compile(
-            r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>'
-            r"(?P<rest>.*?)(?=<a[^>]*class=\"result__a\"|<div class=\"nav-link\"|$)",
-            flags=re.DOTALL,
-        )
+        """Parse https://lite.duckduckgo.com/lite/ HTML (result-link + result-snippet)."""
         results: list[dict[str, str]] = []
-        for match in pattern.finditer(html_text):
-            snippet_match = re.search(
-                r'class="result__snippet"[^>]*>(.*?)</a>',
-                match.group("rest"),
-                flags=re.DOTALL,
+        for open_tag in re.finditer(r"<a\b([^>]*)>", html_text, flags=re.IGNORECASE):
+            tag_attrs = open_tag.group(1)
+            if not re.search(r"class\s*=\s*['\"]result-link['\"]", tag_attrs, re.IGNORECASE):
+                continue
+            href_m = re.search(r"\bhref\s*=\s*(['\"])([^'\"]*)\1", tag_attrs, re.IGNORECASE)
+            if not href_m:
+                continue
+            href = href_m.group(2)
+            start_content = open_tag.end()
+            end_a = html_text.find("</a>", start_content)
+            if end_a == -1:
+                continue
+            title = cls._normalize_html_text(html_text[start_content:end_a])
+            url = cls._extract_duckduckgo_result_url(href)
+            rest = html_text[end_a + len("</a>") :]
+            snippet_m = re.search(
+                r"<td[^>]*\bclass\s*=\s*['\"]result-snippet['\"][^>]*>(.*?)</td>",
+                rest,
+                flags=re.DOTALL | re.IGNORECASE,
             )
             snippet = (
-                cls._normalize_html_text(snippet_match.group(1))
-                if snippet_match is not None
-                else ""
+                cls._normalize_html_text(snippet_m.group(1)) if snippet_m else ""
             )
-            title = cls._normalize_html_text(match.group("title"))
-            url = cls._extract_duckduckgo_result_url(match.group("href"))
-            if not title or not url:
-                continue
-            results.append({"title": title, "url": url, "snippet": snippet})
+            if title and url:
+                results.append({"title": title, "url": url, "snippet": snippet})
             if len(results) >= max_results:
                 break
         return results
+
+    @classmethod
+    def _extract_html_title(cls, html_text: str) -> str:
+        match = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.DOTALL | re.IGNORECASE)
+        if match is None:
+            return ""
+        return cls._normalize_html_text(match.group(1))
+
+    @classmethod
+    def _html_to_text(cls, html_text: str) -> str:
+        parser = cls._HTMLTextExtractor()
+        parser.feed(html_text)
+        parser.close()
+        return parser.get_text()
+
+    async def _fetch_url(self, url: str) -> str:
+        timeout_seconds = self.settings.genai.web_search.timeout_seconds
+        headers = {"User-Agent": "Mozilla/5.0"}
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return self._json_dumps({"url": url, "error": "fetch_url requires a valid http or https URL"})
+
+        request = Request(url, headers=headers)
+
+        def fetch_response() -> tuple[str, str]:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                content_type = response.headers.get("Content-Type", "")
+                charset = response.headers.get_content_charset() or "utf-8"
+                body = response.read().decode(charset, "ignore")
+                return content_type, body
+
+        content_type, body = await asyncio.to_thread(fetch_response)
+        title = ""
+        excerpt = ""
+        if "html" in content_type.lower():
+            title = self._extract_html_title(body)
+            excerpt = self._html_to_text(body)
+        else:
+            excerpt = re.sub(r"\s+", " ", body).strip()
+
+        if len(excerpt) > 6000:
+            excerpt = excerpt[:6000].rsplit(" ", 1)[0].rstrip() + "…"
+
+        return self._json_dumps(
+            {
+                "url": url,
+                "title": title,
+                "content_type": content_type,
+                "content": excerpt,
+            }
+        )
 
     def _build_tools(self) -> list[dict[str, Any]]:
         if not self.settings.genai.web_search.enabled:
@@ -2030,7 +2263,8 @@ class _GenAILocalWithWebTools(GenAIBase):
                     "name": "search_web",
                     "description": (
                         "Search the public web for current or external information and "
-                        "return a few relevant results with snippets."
+                        "return a few relevant results with snippets. Use for time-sensitive "
+                        "or verifiable facts (news, stats, dates, current heads of state, etc.)."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2040,7 +2274,10 @@ class _GenAILocalWithWebTools(GenAIBase):
                                 "type": "string",
                                 "description": (
                                     "The search query to look up on the web. Do not invent "
-                                    "specific years or dates unless the user provided them."
+                                    "specific years or dates unless the user provided them. "
+                                    "When a narrower source would help, use operators like "
+                                    "site:github.com, site:wikipedia.org, or "
+                                    "site:docs.python.org."
                                 ),
                             },
                             "max_results": {
@@ -2050,7 +2287,27 @@ class _GenAILocalWithWebTools(GenAIBase):
                         },
                     },
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fetch_url",
+                    "description": (
+                        "Fetch a public URL and return readable page text so you can answer "
+                        "questions about a user-provided link."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "required": ["url"],
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "A full http or https URL to fetch and read.",
+                            }
+                        },
+                    },
+                },
+            },
         ]
 
     async def _search_web(
@@ -2064,7 +2321,7 @@ class _GenAILocalWithWebTools(GenAIBase):
         headers = {"User-Agent": "Mozilla/5.0"}
 
         async def run_search(search_query: str) -> list[dict[str, str]]:
-            url = f"https://html.duckduckgo.com/html/?q={quote_plus(search_query)}"
+            url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(search_query)}"
             request = Request(url, headers=headers)
 
             def fetch_html() -> str:
@@ -2072,7 +2329,7 @@ class _GenAILocalWithWebTools(GenAIBase):
                     return response.read().decode("utf-8", "ignore")
 
             html_text = await asyncio.to_thread(fetch_html)
-            return self._parse_duckduckgo_results(html_text, max_results)
+            return self._parse_duckduckgo_lite_results(html_text, max_results)
 
         results = await run_search(query)
         simplified_query = re.sub(r"\b20\d{2}\b", " ", query)
@@ -2092,6 +2349,16 @@ class _GenAILocalWithWebTools(GenAIBase):
     async def _execute_parsed_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> tuple[str, str]:
+        if name == "fetch_url":
+            url = str(arguments.get("url") or "").strip()
+            if not url:
+                return name, self._json_dumps({"error": "fetch_url requires a url"})
+            logger.info(f"LLM tool call: fetch_url url={url!r}")
+            try:
+                return name, await self._fetch_url(url)
+            except Exception as exc:
+                logger.warning(f"URL fetch failed for {url!r}: {exc}")
+                return name, self._json_dumps({"url": url, "error": str(exc)})
         if name != "search_web":
             return name or "unknown_tool", self._json_dumps(
                 {"error": f"Unsupported tool call: {name or 'unknown'}"}
@@ -2137,10 +2404,16 @@ class _GenAILocalWithWebTools(GenAIBase):
     def _extract_sources_from_tool_result(
         self, tool_name: str, tool_result: str
     ) -> list[dict[str, str]]:
-        if tool_name != "search_web":
-            return []
         parsed = self._parse_json_response(tool_result)
         if parsed is None:
+            return []
+        if tool_name == "fetch_url":
+            url = str(parsed.get("url") or "").strip()
+            title = str(parsed.get("title") or "").strip() or url
+            if not url:
+                return []
+            return [{"title": title, "url": url}]
+        if tool_name != "search_web":
             return []
         raw_results = parsed.get("results")
         if not isinstance(raw_results, list):
@@ -2187,6 +2460,15 @@ class _GenAILocalWithWebTools(GenAIBase):
 
         return f"{content}{separator}{sources_block}".strip()
 
+    _PY_TOOL_CALL_RE = re.compile(
+        r"\b(search_web|fetch_url)\(([^)]*)\)",
+        flags=re.IGNORECASE,
+    )
+    _PY_TOOL_KV_RE = re.compile(
+        r"""(\w+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^,]+?))(?=\s*,|\s*$)""",
+        flags=re.DOTALL,
+    )
+
     @staticmethod
     def _strip_tool_call_blocks(content: str) -> str:
         cleaned = re.sub(
@@ -2195,15 +2477,16 @@ class _GenAILocalWithWebTools(GenAIBase):
             content,
             flags=re.DOTALL | re.IGNORECASE,
         )
+        cleaned = _GenAILocalWithWebTools._PY_TOOL_CALL_RE.sub("", cleaned)
         return cleaned.strip()
 
     def _parse_inline_tool_calls(self, content: str) -> list[dict[str, Any]]:
+        parsed_calls: list[dict[str, Any]] = []
         blocks = re.findall(
             r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
             content,
             flags=re.DOTALL | re.IGNORECASE,
         )
-        parsed_calls: list[dict[str, Any]] = []
         for idx, block in enumerate(blocks):
             try:
                 payload = json.loads(block)
@@ -2232,22 +2515,72 @@ class _GenAILocalWithWebTools(GenAIBase):
                 }
             )
             if len(parsed_calls) >= self._MAX_TOOL_CALLS_PER_ROUND:
+                return parsed_calls
+
+        # Python-style: search_web(query="...", max_results=3)
+        for idx, m in enumerate(self._PY_TOOL_CALL_RE.finditer(content)):
+            name = m.group(1).lower()
+            args_blob = m.group(2)
+            args_dict: dict[str, Any] = {}
+            for kv in self._PY_TOOL_KV_RE.finditer(args_blob):
+                key = kv.group(1)
+                val = kv.group(2) if kv.group(2) is not None else (
+                    kv.group(3) if kv.group(3) is not None else (kv.group(4) or "").strip()
+                )
+                if val == "":
+                    continue
+                if val.isdigit():
+                    args_dict[key] = int(val)
+                else:
+                    args_dict[key] = val
+            if not args_dict:
+                continue
+            parsed_calls.append(
+                {
+                    "id": f"inline-pycall-{idx}",
+                    "name": name,
+                    "arguments": args_dict,
+                }
+            )
+            if len(parsed_calls) >= self._MAX_TOOL_CALLS_PER_ROUND:
                 break
         return parsed_calls
 
     def _build_system_prompt(
-        self, platform: str = "discord", *, tools_enabled: bool = False
+        self,
+        platform: str = "discord",
+        *,
+        tools_enabled: bool = False,
+        reply_mode: Optional[str] = None,
+        retry_hint: Optional[str] = None,
     ) -> str:
-        prompt = self._build_personality_system_prompt(platform)
+        prompt = self._build_personality_system_prompt(
+            platform, reply_mode=reply_mode, retry_hint=retry_hint
+        )
         if not tools_enabled:
             return prompt
         return (
             prompt
             + "\n\n[Tool Use]\n"
-            + "You may call search_web when the user asks for current events, live facts, "
-            + "or information that is not present in the chat transcript. Use it sparingly. "
+            + "You must call search_web when the user asks for current events, live facts, "
+            + "official information, stats, dates, who currently holds office (for example "
+            + "the president or head of state of a country), or other externally verifiable "
+            + "facts that are not fully grounded in the chat transcript. Do not answer those "
+            + "from memory alone. "
+            + "When the current message, the replied-to message, or the immediate thread includes "
+            + "a public URL and the user is asking about that link or its claims, call fetch_url "
+            + "and read it before answering. "
+            + "For casual opinions, jokes, or purely conversational replies that do not depend "
+            + "on external facts, do not use search_web. "
+            + "If a question is broad, technical, or could be answered from more than one angle, "
+            + "you may call search_web twice in the same round with two meaningfully different "
+            + "queries instead of waiting to fail first. Prefer complementary angles over "
+            + "near-duplicate rewordings. "
             + "When building a search query, do not assume a year or date unless the user "
             + "explicitly gave one. "
+            + "When you need official docs, factual references, or higher-signal technical "
+            + "results, narrow the query with site: operators such as site:github.com, "
+            + "site:wikipedia.org, or site:docs.python.org. "
             + "After using a tool, answer naturally in character and never mention tool names "
             + "or internal schemas."
         )
@@ -2269,7 +2602,7 @@ class _GenAILocalWithWebTools(GenAIBase):
             logger.warning("No conversation history found.")
             return "error", "No conversation history available to judge."
 
-        user_payload, inline_images, valid_target_user_ids = await self._build_debate_payload(
+        user_payload, inline_images = await self._build_debate_payload(
             ctx, messages_for_context, participants, topic=topic
         )
         try:
@@ -2283,9 +2616,6 @@ class _GenAILocalWithWebTools(GenAIBase):
                 ],
                 self._build_personality_system_prompt("discord"),
             )
-            response = await self._finalize_visible_response(
-                response, getattr(ctx.guild, "id", None), valid_target_user_ids
-            )
             return self._parse_debate_response(response, participants)
         except Exception as exc:
             logger.error(f"Error occurred in judge_debate: {exc}")
@@ -2297,6 +2627,10 @@ class _GenAILocalWithWebTools(GenAIBase):
         question: str,
         user_ids: Optional[set[int]] = None,
         retry_hint: Optional[str] = None,
+        history_before: Optional[datetime] = None,
+        *,
+        recent_context_human_turns: Optional[int] = None,
+        merge_reply_chain: bool = True,
     ) -> str:
         has_reference = bool(message.reference and message.reference.message_id)
         reply_mode = self._classify_mention_reply_mode(
@@ -2323,18 +2657,25 @@ class _GenAILocalWithWebTools(GenAIBase):
                 if message.id not in {m.id for m in messages_for_context}:
                     messages_for_context.append(message)
         else:
-            messages_for_context = await self._collect_recent_context_messages(
-                message,
-                self._mention_context_limit(
+            _ctx_limit = (
+                recent_context_human_turns
+                if recent_context_human_turns is not None
+                else self._mention_context_limit(
                     question,
                     settings.genai.question.recent_messages,
                     has_reference=has_reference,
                     retry_hint=retry_hint,
-                ),
+                )
+            )
+            messages_for_context = await self._collect_recent_context_messages(
+                message,
+                _ctx_limit,
                 user_ids=user_ids,
                 include_current=has_reference,
+                history_before=history_before,
+                merge_reply_chain=merge_reply_chain,
             )
-        user_payload, inline_images, valid_target_user_ids = await self._build_mention_reply_payload(
+        user_payload, inline_images, resolved_reply_mode = await self._build_mention_reply_payload(
             message,
             messages_for_context,
             question,
@@ -2343,6 +2684,26 @@ class _GenAILocalWithWebTools(GenAIBase):
             retry_hint=retry_hint,
         )
         tools = self._build_tools()
+        system_prompt = self._build_system_prompt(
+            "discord", tools_enabled=bool(tools),
+            reply_mode=resolved_reply_mode, retry_hint=retry_hint,
+        )
+        payload_tokens = self.count_tokens(user_payload)
+        system_prompt_tokens = self.count_tokens(system_prompt)
+        inline_image_chars = sum(len(img) for img in inline_images)
+        logger.info(
+            "discord_request_metrics "
+            f"message={message.id} "
+            f"reply_mode={reply_mode} "
+            f"has_images={bool(inline_images)} "
+            f"inline_images={len(inline_images)} "
+            f"context_messages={len(messages_for_context)} "
+            f"payload_tokens={payload_tokens} "
+            f"system_prompt_tokens={system_prompt_tokens} "
+            f"approx_prompt_tokens={payload_tokens + system_prompt_tokens} "
+            f"inline_image_b64_chars={inline_image_chars} "
+            f"question_chars={len(question)}"
+        )
         try:
             response = await self._request_completion(
                 [
@@ -2352,12 +2713,10 @@ class _GenAILocalWithWebTools(GenAIBase):
                         images=inline_images or None,
                     )
                 ],
-                self._build_system_prompt("discord", tools_enabled=bool(tools)),
+                system_prompt,
                 tools=tools or None,
             )
-            return await self._finalize_visible_response(
-                response, getattr(message.guild, "id", None), valid_target_user_ids
-            )
+            return response
         except Exception as exc:
             logger.error(f"Error answering mention question: {exc}")
             return "I couldn't answer that right now."
@@ -2396,45 +2755,16 @@ class _GenAILocalWithWebTools(GenAIBase):
                         content=user_payload,
                     )
                 ],
-                self._build_system_prompt(platform, tools_enabled=bool(tools)),
+                self._build_system_prompt(
+                    platform, tools_enabled=bool(tools),
+                    reply_mode=reply_mode, retry_hint=retry_hint,
+                ),
                 tools=tools or None,
             )
-            return await self._finalize_visible_response(response, None, None)
+            return response
         except Exception as exc:
             logger.error(f"Error answering social question: {exc}")
             return "I couldn't answer that right now."
-
-    async def score_message_respect(self, message: Message) -> tuple[int, str]:
-        messages_for_context = await self._collect_recent_context_messages(
-            message,
-            settings.genai.question.recent_messages,
-            include_current=True,
-        )
-        user_payload, inline_images = await self._build_respect_payload(
-            message, messages_for_context
-        )
-        try:
-            response = await self._request_completion(
-                [
-                    ChatMessage(
-                        role=Role.USER,
-                        content=user_payload,
-                        images=inline_images or None,
-                    )
-                ],
-                self._build_personality_system_prompt("discord"),
-            )
-            parsed = self._parse_json_response(response)
-            if parsed is not None and "delta" in parsed:
-                delta = int(parsed["delta"])
-                delta = max(-self.settings.genai.respect.max_delta_per_message, delta)
-                delta = min(self.settings.genai.respect.max_delta_per_message, delta)
-                reason = str(parsed.get("reason") or "No reason provided.").strip()
-                return delta, reason[:250]
-            return self._parse_respect_response(response)
-        except Exception as exc:
-            logger.error(f"Error scoring respect: {exc}")
-            return 0, "Respect scoring failed."
 
 
 class GenAIOllama(_GenAILocalWithWebTools):
@@ -2444,71 +2774,74 @@ class GenAIOllama(_GenAILocalWithWebTools):
         system_prompt: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
     ) -> str:
-        payload_messages: list[dict[str, Any]] = []
-        collected_sources: list[dict[str, str]] = []
-        if system_prompt:
-            payload_messages.append({"role": "system", "content": system_prompt.strip()})
-        payload_messages.extend(message.to_dict() for message in messages)  # type: ignore[arg-type]
+        async def run_request() -> str:
+            payload_messages: list[dict[str, Any]] = []
+            collected_sources: list[dict[str, str]] = []
+            if system_prompt:
+                payload_messages.append({"role": "system", "content": system_prompt.strip()})
+            payload_messages.extend(message.to_dict() for message in messages)  # type: ignore[arg-type]
 
-        url = f"{self.settings.genai.base_url.rstrip('/')}/api/chat"
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for round_idx in range(self._MAX_TOOL_ROUNDS + 1):
-                num_predict = max(self.settings.genai.tokens.output_max, 2048)
-                payload = {
-                    "model": self.settings.genai.model,
-                    "messages": payload_messages,
-                    "stream": False,
-                    "options": {
-                        "num_predict": num_predict,
-                        "temperature": self.settings.genai.temperature,
-                        "repeat_penalty": self.settings.genai.repeat_penalty,
-                    },
-                }
-                if tools:
-                    payload["tools"] = tools
+            url = f"{self.settings.genai.base_url.rstrip('/')}/api/chat"
+            timeout = aiohttp.ClientTimeout(total=float(self.settings.genai.request_timeout))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for round_idx in range(self._MAX_TOOL_ROUNDS + 1):
+                    num_predict = max(self.settings.genai.tokens.output_max, 2048)
+                    payload = {
+                        "model": self.settings.genai.model,
+                        "messages": payload_messages,
+                        "stream": False,
+                        "options": {
+                            "num_predict": num_predict,
+                            "temperature": self.settings.genai.temperature,
+                            "repeat_penalty": self.settings.genai.repeat_penalty,
+                        },
+                    }
+                    if tools:
+                        payload["tools"] = tools
 
-                async with session.post(url, json=payload) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+                    async with session.post(url, json=payload) as response:
+                        response.raise_for_status()
+                        data = await response.json()
 
-                msg = data.get("message") or {}
-                tool_calls = msg.get("tool_calls") or []
-                if tools and tool_calls and round_idx < self._MAX_TOOL_ROUNDS:
-                    assistant_message: dict[str, Any] = {"role": "assistant"}
-                    if msg.get("content"):
-                        assistant_message["content"] = msg["content"]
-                    assistant_message["tool_calls"] = tool_calls
-                    payload_messages.append(assistant_message)
+                    msg = data.get("message") or {}
+                    tool_calls = msg.get("tool_calls") or []
+                    if tools and tool_calls and round_idx < self._MAX_TOOL_ROUNDS:
+                        assistant_message: dict[str, Any] = {"role": "assistant"}
+                        if msg.get("content"):
+                            assistant_message["content"] = msg["content"]
+                        assistant_message["tool_calls"] = tool_calls
+                        payload_messages.append(assistant_message)
 
-                    for tool_call in tool_calls[: self._MAX_TOOL_CALLS_PER_ROUND]:
-                        tool_name, tool_result = await self._execute_tool_call(tool_call)
-                        for source in self._extract_sources_from_tool_result(
-                            tool_name, tool_result
-                        ):
-                            if source not in collected_sources:
-                                collected_sources.append(source)
-                        payload_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_name": tool_name,
-                                "content": tool_result,
-                            }
-                        )
-                    continue
+                        for tool_call in tool_calls[: self._MAX_TOOL_CALLS_PER_ROUND]:
+                            tool_name, tool_result = await self._execute_tool_call(tool_call)
+                            for source in self._extract_sources_from_tool_result(
+                                tool_name, tool_result
+                            ):
+                                if source not in collected_sources:
+                                    collected_sources.append(source)
+                            payload_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_name": tool_name,
+                                    "content": tool_result,
+                                }
+                            )
+                        continue
 
-                content = msg.get("content") or ""
-                if not content and msg.get("thinking"):
-                    content = self._extract_answer_from_thinking(msg["thinking"])
-                if not content:
-                    logger.error(f"Unexpected Ollama response: {data}")
-                    return "not worth my time"
-                content = self._strip_think_block(content)
-                content = self._append_sources_to_response(content, collected_sources)
-                logger.info(f"Ollama response: {content}")
-                return content
+                    content = msg.get("content") or ""
+                    if not content and msg.get("thinking"):
+                        content = self._extract_answer_from_thinking(msg["thinking"])
+                    if not content:
+                        logger.error(f"Unexpected Ollama response: {data}")
+                        return "not worth my time"
+                    content = self._strip_think_block(content)
+                    content = self._append_sources_to_response(content, collected_sources)
+                    logger.info(f"Ollama response: {content}")
+                    return content
 
-        return "not worth my time"
+            return "not worth my time"
+
+        return await self._run_local_request("ollama_chat", run_request)
 
 
 class GenAILlamaCpp(_GenAILocalWithWebTools):
@@ -2536,7 +2869,7 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
         self._openai_local = OpenAI(
             base_url=base_u,
             api_key="sk-no-key-required",
-            timeout=120.0,
+            timeout=float(settings.genai.request_timeout),
         )
         self.client = self._openai_local
 
@@ -2575,141 +2908,321 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
         system_prompt: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
     ) -> str:
-        has_images = any(m.images for m in messages)
-        openai_messages = self._build_openai_messages(
-            messages, system_prompt, include_images=has_images
-        )
+        async def run_request() -> str:
+            has_images = any(m.images for m in messages)
+            openai_messages = self._build_openai_messages(
+                messages, system_prompt, include_images=has_images
+            )
 
-        collected_sources: list[dict[str, str]] = []
-        temperature = float(self.settings.genai.temperature)
-        repeat_penalty = float(self.settings.genai.repeat_penalty)
-        extra_body: dict[str, Any] = {
-            "repeat_penalty": repeat_penalty,
-            "parse_tool_calls": True,
-            "parallel_tool_calls": True,
-        }
-
-        def _chat_create(msgs: list[dict[str, Any]], use_tools: bool):
-            kwargs: dict[str, Any] = {
-                "model": self.settings.genai.model,
-                "messages": msgs,
-                "temperature": temperature,
-                "extra_body": extra_body,
+            collected_sources: list[dict[str, str]] = []
+            temperature = float(self.settings.genai.temperature)
+            repeat_penalty = float(self.settings.genai.repeat_penalty)
+            extra_body: dict[str, Any] = {
+                "repeat_penalty": repeat_penalty,
+                "parse_tool_calls": True,
+                "parallel_tool_calls": True,
             }
-            if use_tools and tools:
-                kwargs["tools"] = tools
-            return self._openai_local.chat.completions.create(**kwargs)
 
-        for round_idx in range(self._MAX_TOOL_ROUNDS + 1):
-            try:
-                response = await asyncio.to_thread(
-                    _chat_create, openai_messages, bool(tools)
-                )
-            except Exception as exc:
-                if has_images and round_idx == 0 and "400" in str(exc):
-                    logger.warning(
-                        f"Image request failed ({exc}), retrying without images."
-                    )
-                    has_images = False
-                    openai_messages = self._build_openai_messages(
-                        messages, system_prompt, include_images=False
-                    )
+            max_tokens = max(self.settings.genai.tokens.output_max, 256)
+
+            def _chat_create(msgs: list[dict[str, Any]], use_tools: bool):
+                kwargs: dict[str, Any] = {
+                    "model": self.settings.genai.model,
+                    "messages": msgs,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "extra_body": extra_body,
+                }
+                if use_tools and tools:
+                    kwargs["tools"] = tools
+                return self._openai_local.chat.completions.create(**kwargs)
+
+            for round_idx in range(self._MAX_TOOL_ROUNDS + 1):
+                try:
                     response = await asyncio.to_thread(
                         _chat_create, openai_messages, bool(tools)
                     )
-                else:
-                    raise
-            msg = response.choices[0].message
-            tool_calls = getattr(msg, "tool_calls", None) or []
-            parsed_calls: list[dict[str, Any]] = []
-            for tc in tool_calls[: self._MAX_TOOL_CALLS_PER_ROUND]:
-                fn = tc.function
-                raw_args = fn.arguments or "{}"
-                try:
-                    arguments = json.loads(raw_args) if raw_args.strip() else {}
-                except json.JSONDecodeError:
-                    arguments = {}
-                if not isinstance(arguments, dict):
-                    arguments = {}
-                parsed_calls.append(
-                    {"id": tc.id, "name": fn.name, "arguments": arguments}
-                )
-
-            inline_call_mode = False
-            if tools and not parsed_calls and isinstance(msg.content, str):
-                parsed_calls = self._parse_inline_tool_calls(msg.content)
-                inline_call_mode = bool(parsed_calls)
-                if inline_call_mode:
-                    logger.warning(
-                        "llama.cpp returned inline <tool_call> content; using parser fallback."
-                    )
-
-            if tools and parsed_calls and round_idx < self._MAX_TOOL_ROUNDS:
-                assistant_message: dict[str, Any] = {"role": "assistant"}
-                if msg.content:
-                    if inline_call_mode:
-                        visible_content = self._strip_tool_call_blocks(msg.content)
-                        if visible_content:
-                            assistant_message["content"] = visible_content
+                except Exception as exc:
+                    if has_images and round_idx == 0 and "400" in str(exc):
+                        logger.warning(
+                            f"Image request failed ({exc}), retrying without images."
+                        )
+                        has_images = False
+                        openai_messages = self._build_openai_messages(
+                            messages, system_prompt, include_images=False
+                        )
+                        response = await asyncio.to_thread(
+                            _chat_create, openai_messages, bool(tools)
+                        )
                     else:
-                        assistant_message["content"] = msg.content
-                serialized: list[dict[str, Any]] = []
-                for call in parsed_calls:
-                    serialized.append(
-                        {
-                            "id": call["id"],
-                            "type": "function",
-                            "function": {
-                                "name": call["name"],
-                                "arguments": json.dumps(call["arguments"]),
-                            },
-                        }
+                        raise
+                msg = response.choices[0].message
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                parsed_calls: list[dict[str, Any]] = []
+                for tc in tool_calls[: self._MAX_TOOL_CALLS_PER_ROUND]:
+                    fn = tc.function
+                    raw_args = fn.arguments or "{}"
+                    try:
+                        arguments = json.loads(raw_args) if raw_args.strip() else {}
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    parsed_calls.append(
+                        {"id": tc.id, "name": fn.name, "arguments": arguments}
                     )
-                assistant_message["tool_calls"] = serialized
-                openai_messages.append(assistant_message)
 
-                for call in parsed_calls:
-                    arguments = call["arguments"]
-                    tool_name, tool_result = await self._execute_parsed_tool(
-                        call["name"], arguments
+                inline_call_mode = False
+                if tools and not parsed_calls and isinstance(msg.content, str):
+                    parsed_calls = self._parse_inline_tool_calls(msg.content)
+                    inline_call_mode = bool(parsed_calls)
+                    if inline_call_mode:
+                        logger.warning(
+                            "llama.cpp returned inline <tool_call> content; using parser fallback."
+                        )
+
+                if tools and parsed_calls and round_idx < self._MAX_TOOL_ROUNDS:
+                    assistant_message: dict[str, Any] = {"role": "assistant"}
+                    if msg.content:
+                        if inline_call_mode:
+                            visible_content = self._strip_tool_call_blocks(msg.content)
+                            if visible_content:
+                                assistant_message["content"] = visible_content
+                        else:
+                            assistant_message["content"] = msg.content
+                    serialized: list[dict[str, Any]] = []
+                    for call in parsed_calls:
+                        serialized.append(
+                            {
+                                "id": call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": call["name"],
+                                    "arguments": json.dumps(call["arguments"]),
+                                },
+                            }
+                        )
+                    assistant_message["tool_calls"] = serialized
+                    openai_messages.append(assistant_message)
+
+                    for call in parsed_calls:
+                        arguments = call["arguments"]
+                        tool_name, tool_result = await self._execute_parsed_tool(
+                            call["name"], arguments
+                        )
+                        for source in self._extract_sources_from_tool_result(
+                            tool_name, tool_result
+                        ):
+                            if source not in collected_sources:
+                                collected_sources.append(source)
+                        openai_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": tool_result,
+                            }
+                        )
+                    continue
+
+                content = (msg.content or "").strip() if msg.content else ""
+                if not content:
+                    for attr in ("reasoning_content", "reasoning", "thinking"):
+                        val = getattr(msg, attr, None)
+                        if isinstance(val, str) and val.strip():
+                            content = self._extract_answer_from_thinking(val)
+                            break
+                if not content and getattr(msg, "model_extra", None):
+                    for key in ("reasoning_content", "reasoning", "thinking"):
+                        val = (msg.model_extra or {}).get(key)
+                        if isinstance(val, str) and val.strip():
+                            content = self._extract_answer_from_thinking(val)
+                            break
+                if not content and tool_calls:
+                    # Tool budget exhausted but model still wants to call tools.
+                    # Force a final compose pass with no tools available.
+                    logger.warning(
+                        "Tool rounds exhausted with empty content; forcing "
+                        "no-tool final compose pass."
                     )
-                    for source in self._extract_sources_from_tool_result(
-                        tool_name, tool_result
-                    ):
-                        if source not in collected_sources:
-                            collected_sources.append(source)
-                    openai_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": tool_result,
-                        }
+                    final_response = await asyncio.to_thread(
+                        _chat_create, openai_messages, False
                     )
-                continue
+                    final_msg = final_response.choices[0].message
+                    content = (final_msg.content or "").strip() if final_msg.content else ""
+                if not content:
+                    logger.error(f"Unexpected llama.cpp chat response: {response!r}")
+                    return "not worth my time"
+                content = self._strip_think_block(content)
+                content = self._append_sources_to_response(content, collected_sources)
+                logger.info(f"llama.cpp response: {content}")
+                return content
 
-            content = (msg.content or "").strip() if msg.content else ""
-            if not content:
-                for attr in ("reasoning_content", "reasoning", "thinking"):
-                    val = getattr(msg, attr, None)
-                    if isinstance(val, str) and val.strip():
-                        content = self._extract_answer_from_thinking(val)
-                        break
-            if not content and getattr(msg, "model_extra", None):
-                for key in ("reasoning_content", "reasoning", "thinking"):
-                    val = (msg.model_extra or {}).get(key)
-                    if isinstance(val, str) and val.strip():
-                        content = self._extract_answer_from_thinking(val)
-                        break
-            if not content:
-                logger.error(f"Unexpected llama.cpp chat response: {response!r}")
-                return "not worth my time"
-            content = self._strip_think_block(content)
-            content = self._append_sources_to_response(content, collected_sources)
-            logger.info(f"llama.cpp response: {content}")
-            return content
+            return "not worth my time"
 
-        return "not worth my time"
+        return await self._run_local_request("llamacpp_chat", run_request)
 
+    async def _openai_stream_deltas_async(
+        self, openai_messages: list[dict[str, Any]]
+    ) -> AsyncIterator[str]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        exc_holder: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                max_tokens = max(self.settings.genai.tokens.output_max, 256)
+                stream = self._openai_local.chat.completions.create(
+                    model=self.settings.genai.model,
+                    messages=openai_messages,
+                    temperature=float(self.settings.genai.temperature),
+                    max_tokens=max_tokens,
+                    stream=True,
+                    extra_body={
+                        "repeat_penalty": float(self.settings.genai.repeat_penalty),
+                        "parse_tool_calls": False,
+                        "parallel_tool_calls": False,
+                    },
+                )
+                for chunk in stream:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    ch0 = chunk.choices[0]
+                    delta = getattr(ch0, "delta", None)
+                    if delta is None:
+                        continue
+                    piece = getattr(delta, "content", None)
+                    if piece:
+                        fut = asyncio.run_coroutine_threadsafe(queue.put(piece), loop)
+                        fut.result(timeout=600)
+            except BaseException as e:
+                exc_holder.append(e)
+            finally:
+                try:
+                    asyncio.run_coroutine_threadsafe(queue.put(None), loop).result(
+                        timeout=60
+                    )
+                except Exception:
+                    pass
+
+        exec_fut = loop.run_in_executor(None, worker)
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+        await exec_fut
+        if exc_holder:
+            raise exc_holder[0]
+
+    async def answer_message_question_streaming(
+        self,
+        message: Message,
+        question: str,
+        user_ids: Optional[set[int]] = None,
+        retry_hint: Optional[str] = None,
+        history_before: Optional[datetime] = None,
+        *,
+        recent_context_human_turns: Optional[int] = None,
+        merge_reply_chain: bool = True,
+    ) -> AsyncIterator[str]:
+        has_reference = bool(message.reference and message.reference.message_id)
+        reply_mode = self._classify_mention_reply_mode(
+            question, has_reference=has_reference, retry_hint=retry_hint
+        )
+        has_image_attachments = self._VISION_ENABLED and self._message_has_images(message)
+        if not has_image_attachments and has_reference and self._VISION_ENABLED:
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+                has_image_attachments = self._message_has_images(ref)
+            except Exception:
+                pass
+        if has_image_attachments:
+            guild = message.guild
+            bot_user_id: Optional[int] = guild.me.id if guild and guild.me else None
+            chain = await self._collect_reference_chain_messages(
+                message, bot_user_id, user_ids
+            )
+            if len(chain) > 3:
+                chain = chain[-3:]
+            messages_for_context = chain
+            if has_reference:
+                messages_for_context = list(messages_for_context)
+                if message.id not in {m.id for m in messages_for_context}:
+                    messages_for_context.append(message)
+        else:
+            _ctx_limit_s = (
+                recent_context_human_turns
+                if recent_context_human_turns is not None
+                else self._mention_context_limit(
+                    question,
+                    settings.genai.question.recent_messages,
+                    has_reference=has_reference,
+                    retry_hint=retry_hint,
+                )
+            )
+            messages_for_context = await self._collect_recent_context_messages(
+                message,
+                _ctx_limit_s,
+                user_ids=user_ids,
+                include_current=has_reference,
+                history_before=history_before,
+                merge_reply_chain=merge_reply_chain,
+            )
+        user_payload, inline_images, resolved_reply_mode = await self._build_mention_reply_payload(
+            message,
+            messages_for_context,
+            question,
+            user_ids=user_ids,
+            reply_mode=reply_mode,
+            retry_hint=retry_hint,
+            skip_images=True,
+        )
+        system_prompt = self._build_system_prompt(
+            "discord",
+            tools_enabled=False,
+            reply_mode=resolved_reply_mode,
+            retry_hint=retry_hint,
+        )
+        payload_tokens = self.count_tokens(user_payload)
+        system_prompt_tokens = self.count_tokens(system_prompt)
+        inline_image_chars = sum(len(img) for img in inline_images)
+        logger.info(
+            "discord_request_metrics "
+            f"message={message.id} "
+            f"reply_mode={reply_mode} "
+            f"has_images={bool(inline_images)} "
+            f"inline_images={len(inline_images)} "
+            f"context_messages={len(messages_for_context)} "
+            f"payload_tokens={payload_tokens} "
+            f"system_prompt_tokens={system_prompt_tokens} "
+            f"approx_prompt_tokens={payload_tokens + system_prompt_tokens} "
+            f"inline_image_b64_chars={inline_image_chars} "
+            f"question_chars={len(question)} "
+            f"streaming=true"
+        )
+        openai_messages = self._build_openai_messages(
+            [
+                ChatMessage(
+                    role=Role.USER,
+                    content=user_payload,
+                    images=None,
+                )
+            ],
+            system_prompt,
+            include_images=False,
+        )
+
+        async def body() -> AsyncIterator[str]:
+            async for d in self._openai_stream_deltas_async(openai_messages):
+                yield d
+
+        def stream_factory() -> AsyncIterator[str]:
+            return body()
+
+        async for d in self._run_local_streaming(
+            "llamacpp_chat_stream", stream_factory
+        ):
+            yield d
 
 
 if settings.genai.model.startswith("llamacpp/"):

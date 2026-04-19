@@ -44,8 +44,8 @@ class Betting(commands.Cog):
         return winner_map.get(winner.lower(), BetResult.ERROR)
 
     def calculate_k(self, user: User) -> float:
-        assert user.iq is not None
-        deviation = abs(user.iq - 100)
+        assert user.rating is not None
+        deviation = abs(user.rating - 100)
         base_k = max(6, 16 - (deviation / 10))
         return max(base_k / sqrt(max(user.num_bets, 1)), 1)
 
@@ -55,10 +55,10 @@ class Betting(commands.Cog):
         if result in (BetResult.NONE, BetResult.ERROR):
             raise ValueError("Invalid result value")
 
-        assert user1.iq is not None
-        assert user2.iq is not None
+        assert user1.rating is not None
+        assert user2.rating is not None
 
-        expected1 = 1 / (1 + 10 ** ((user2.iq - user1.iq) / settings.elo.scale))
+        expected1 = 1 / (1 + 10 ** ((user2.rating - user1.rating) / settings.elo.scale))
         expected2 = 1 - expected1
 
         delta1 = self.calculate_k(user1) * (result.value - expected1)
@@ -67,8 +67,8 @@ class Betting(commands.Cog):
         delta1 = max(min(delta1, settings.elo.max_delta), -settings.elo.max_delta)
         delta2 = max(min(delta2, settings.elo.max_delta), -settings.elo.max_delta)
 
-        user1.iq = round(user1.iq + delta1)
-        user2.iq = round(user2.iq + delta2)
+        user1.rating = round(user1.rating + delta1)
+        user2.rating = round(user2.rating + delta2)
 
         user1.num_bets += 1
         user2.num_bets += 1
@@ -101,8 +101,8 @@ class Betting(commands.Cog):
                 user1 = await db.read_or_add_user(bet.guild_id, bet.user_id_1)
                 user2 = await db.read_or_add_user(bet.guild_id, bet.user_id_2)
 
-                start_iq1 = user1.iq
-                start_iq2 = user2.iq
+                start_r1 = user1.rating
+                start_r2 = user2.rating
 
                 winner, genai_response = await genai.client.judge_debate(
                     reaction,
@@ -126,7 +126,7 @@ class Betting(commands.Cog):
 
                 await reaction.message.channel.send(genai_response[0:1999])
                 await reaction.message.channel.send(
-                    f"{member1.display_name}\n{member1.mention} **IQ {start_iq1} -> {user1.iq}**\n{member2.mention} **IQ {start_iq2} -> {user2.iq}**"
+                    f"{member1.display_name}\n{member1.mention} **Rating {start_r1} -> {user1.rating}**\n{member2.mention} **Rating {start_r2} -> {user2.rating}**"
                 )
 
         except Exception as e:
