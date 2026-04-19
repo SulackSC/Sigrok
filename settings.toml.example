@@ -60,6 +60,9 @@ roles = []
 # interval_minutes = 60
 # message = "Hourly reminder."
 
+# Discord user IDs allowed to create / cancel `@Sigrok @schedule ...` jobs.
+# schedule_controller_user_ids = [272913479231471616]
+
 [genai]
 # Active backend (native llama-server on localhost:8081, model alias from llama-server.service).
 model = "llamacpp/qwen3.6-35b-a3b"

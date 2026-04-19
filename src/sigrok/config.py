@@ -111,6 +111,7 @@ class BotSettings(BaseModel):
     voice_record: VoiceRecordSettings = Field(default_factory=VoiceRecordSettings)
     event_posts: list[EventPostRule] = Field(default_factory=list)
     timed_posts: list[TimedPostRule] = Field(default_factory=list)
+    schedule_controller_user_ids: list[int] = Field(default_factory=list)
 
 
 class GenaiHistorySettings(BaseModel):
