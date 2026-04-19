@@ -1,3 +1,6 @@
+# Copy to settings.toml and set Discord snowflakes for your server.
+# See README for .secrets.toml (bot token, optional API keys).
+
 [database]
 url = "sqlite+aiosqlite:///data.db"
 echo = false
@@ -11,16 +14,19 @@ retention = 5
 [bot]
 prefix = "."
 temp_dir = "."
-cogs = ["misc", "presence", "backup", "voice_rec", "bluesky"]
+cogs = ["misc", "presence", "backup", "voice_rec", "bluesky", "conditional_posts"]
 
 [bot.owner]
-id = 477506746986921992
+id = 111111111111111111
 
 [bot.intents]
 guilds = true
 messages = true
 message_content = true
 reactions = true
+# Server Members Intent: must be enabled in the Developer Portal *and* set true here, or the bot
+# fails to connect with PrivilegedIntentsRequired. Keep false unless you need TOML event_posts / presence.
+members = false
 voice_states = true
 
 [bot.voice_record]
@@ -30,34 +36,40 @@ announcement_file = ""
 announcement_interval_seconds = 60
 
 [[bot.whitelist]]
-guild = 1361882687895371838
-channel = 1361882688709198077
+guild = 222222222222222222
+channel = 333333333333333333
 roles = []
 
 [[bot.whitelist]]
-guild = 789692030741774368
-channel = 978273836338413648
+guild = 444444444444444444
+channel = 555555555555555555
 roles = []
 
-[[bot.whitelist]]
-guild = 418288362747592704
-channel = 1179128812341047427
-roles = []
+# Optional TOML: join/leave channel posts (guild must be whitelisted above).
+# [[bot.event_posts]]
+# guild = 222222222222222222
+# channel = 333333333333333333
+# on = "join"
+# message = "Welcome {user_mention} to {guild}!"
+# ignore_bots = true
 
-[[bot.whitelist]]
-guild = 493226632501526548
-channel = 0
-roles = []
+# Optional TOML: fixed-interval channel posts.
+# [[bot.timed_posts]]
+# guild = 222222222222222222
+# channel = 333333333333333333
+# interval_minutes = 60
+# message = "Hourly reminder."
 
 [genai]
 # Active backend (native llama-server on localhost:8081, model alias from llama-server.service).
-model = "llamacpp/qwen3.5-27b"
+model = "llamacpp/qwen3.6-35b-a3b"
 base_url = "http://127.0.0.1:8081"
 temperature = 1.05
 repeat_penalty = 1.15
-# Rollback (Ollama):
-# model = "ollama/qwen3:14b"
-# base_url = "http://127.0.0.1:11434"
+request_timeout = 180
+# Rollback to prior native llama.cpp model:
+# model = "llamacpp/qwen3.5-27b"
+# base_url = "http://127.0.0.1:8081"
 system_prompt = """
 Answer questions strictly within the context of a provided conversation, consisting of a chronological series of user messages.
 When asked for a winner, first identify the main topic or question under dispute, inferred from the conversation itself. Then evaluate the primary disagreement between the two specified users. Consider subtopics only if they are meaningfully tied to this core issue. Ignore unrelated tangents or side disputes.
@@ -81,18 +93,17 @@ Hard constraint: Your entire response must not exceed 2000 characters. If necess
 """
 
 [genai.tokens]
-limit = 120000
+limit = 7000
 overhead_max = 20
 prompt_max = 100
-# For Ollama thinking models: needs room for reasoning + final answer
 output_max = 1024
 
 [genai.history]
-minutes = 120
+minutes = 1440
 messages = 1000
 
 [genai.question]
-recent_messages = 10
+recent_messages = 25
 
 [genai.web_search]
 enabled = true
@@ -105,6 +116,10 @@ cooldown_seconds = 300
 min_chars = 20
 min_words = 4
 max_delta_per_message = 1
+
+[genai.discord_streaming]
+enabled = false
+edit_interval_seconds = 2
 
 
 [elo]

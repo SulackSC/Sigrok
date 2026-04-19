@@ -5,6 +5,8 @@ conversation*
 logs
 # Ignore dynaconf secret files
 .secrets.*
+# Local config (copy from settings.toml.example)
+settings.toml
 data.db
 trash**
 logs/*

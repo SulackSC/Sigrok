@@ -5,6 +5,8 @@ Discord bot with ELO system for discord debates with some shitty SLM as the judg
 Forked from `BrokenDesign/iqbot`:
 https://github.com/BrokenDesign/iqbot
 
+Copy `settings.toml.example` to `settings.toml` and set your Discord owner id, whitelist guild/channel ids, and any other options.
+
 Expects a `.secrets.toml` file containing the API keys:
 
 ```toml
@@ -15,7 +17,7 @@ gpt = "<openai api token>"
 
 ## Local language model (Ollama or llama.cpp)
 
-`settings.toml` `[genai]` chooses the backend via the model prefix:
+In `settings.toml`, `[genai]` chooses the backend via the model prefix:
 
 - `ollama/<tag>` — HTTP `POST {base_url}/api/chat` (default Ollama port `11434`).
 - `llamacpp/<model_id>` — OpenAI-compatible `POST .../v1/chat/completions` against [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server` (this host uses `8081` because OpenWebUI already uses `8080`).
