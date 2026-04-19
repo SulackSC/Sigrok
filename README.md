@@ -4,7 +4,7 @@ Sigrok is a **Discord bot** built on [py-cord](https://github.com/Pycord-Develop
 
 Upstream lineage: forked from [BrokenDesign/iqbot](https://github.com/BrokenDesign/iqbot). The legacy `users.iq` column was renamed to **`rating`**; the original IQ-bot wager flow has been removed.
 
-Run **`alembic upgrade head`** after upgrading if you already have a `data.db` from an older checkout.
+The bot creates `data.db` on first run via `Base.metadata.create_all`. There are no schema migrations — if the model changes break an existing dev DB, delete `data.db` and let it re-init.
 
 ## Features
 
@@ -13,7 +13,7 @@ Run **`alembic upgrade head`** after upgrading if you already have a `data.db` f
 - **Social** — Optional Bluesky posting; optional X (Twitter) bearer token support in config.
 - **Voice** — Chunked recording from voice channels (see `voice_rec` cog).
 - **Automation** — Cron-like and one-shot jobs, join/leave messages, timed posts (`conditional_posts` cog).
-- **Data** — SQLite via SQLAlchemy, Alembic migrations, optional rolling backups (`backup` cog).
+- **Data** — SQLite via SQLAlchemy, optional rolling backups (`backup` cog).
 
 ## Requirements
 
