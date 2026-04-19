@@ -64,7 +64,7 @@ roles = []
 # schedule_controller_user_ids = [272913479231471616]
 
 [genai]
-# Active backend (native llama-server on localhost:8081, model alias from llama-server.service).
+# Active backend (llama.cpp `llama-server` on localhost:8081; alias must match the server's -a flag).
 model = "llamacpp/qwen3.6-35b-a3b"
 base_url = "http://127.0.0.1:8081"
 temperature = 1.05

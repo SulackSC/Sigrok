@@ -59,7 +59,7 @@ Run **`alembic upgrade head`** after upgrading if you already have a `data.db` f
 | `.secrets.toml` | API tokens merged over `settings.toml`. |
 | `resources/sigrok_personality_prompt.txt` | Main Discord personality / system text for the model (see code). |
 
-Systemd unit examples live under `deploy/systemd/` (e.g. `sigrok.service`, `llama-server.service`).
+A `sigrok.service` systemd unit example lives under `deploy/systemd/`.
 
 ## Language models (`[genai]`)
 
