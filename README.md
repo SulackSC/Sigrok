@@ -1,30 +1,78 @@
 # Sigrok
 
-Discord bot with ELO system for discord debates with some shitty SLM as the judge :)
+Sigrok is a **Discord bot** built on [py-cord](https://github.com/Pycord-Development/pycord). It answers when pinged, using a **local or hosted language model** as the brain, with tunable prompts and optional web search. The codebase also includes **debate scoring** (ELO-style “IQ” ratings when the betting cog is enabled), **Bluesky** integration, **voice recording** chunks, **scheduled and conditional channel posts**, and **database backups**.
 
-Forked from `BrokenDesign/iqbot`:
-https://github.com/BrokenDesign/iqbot
+Upstream lineage: forked from [BrokenDesign/iqbot](https://github.com/BrokenDesign/iqbot).
 
-Copy `settings.toml.example` to `settings.toml` and set your Discord owner id, whitelist guild/channel ids, and any other options.
+## Features
 
-Expects a `.secrets.toml` file containing the API keys:
+- **Whitelist** — Only configured guilds/channels are used; the bot leaves servers that are not allowed.
+- **Generative replies** — `@Sigrok` in a whitelisted channel; backends include Ollama, llama.cpp (`llama-server`), OpenAI, and Anthropic (see configuration).
+- **Social** — Optional Bluesky posting; optional X (Twitter) bearer token support in config.
+- **Voice** — Chunked recording from voice channels (see `voice_rec` cog).
+- **Automation** — Cron-like and one-shot jobs, join/leave messages, timed posts (`conditional_posts` cog).
+- **Data** — SQLite via SQLAlchemy, Alembic migrations, optional rolling backups (`backup` cog).
+- **Debates / ELO** — Optional **`betting`** cog for wagers and rating updates; optional **`iq`** cog for IQ-related commands (enable in `[bot] cogs` in `settings.toml`).
 
-```toml
-[tokens]
-bot = "<discord bot token>"
-gpt = "<openai api token>"
-```
+## Requirements
 
-## Local language model (Ollama or llama.cpp)
+- **Python** 3.10+ (see `pyproject.toml`).
+- A **Discord application** and bot token.
+- For local models: **Ollama** or **llama.cpp** `llama-server` (OpenAI-compatible HTTP).
 
-In `settings.toml`, `[genai]` chooses the backend via the model prefix:
+## Quick start
 
-- `ollama/<tag>` — HTTP `POST {base_url}/api/chat` (default Ollama port `11434`).
-- `llamacpp/<model_id>` — OpenAI-compatible `POST .../v1/chat/completions` against [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server` (this host uses `8081` because OpenWebUI already uses `8080`).
+1. Clone the repo and install dependencies, e.g. with [Poetry](https://python-poetry.org/):
 
-For llama.cpp, set `base_url` to the server root (e.g. `http://127.0.0.1:8081`) or already suffixed with `/v1`; the client normalizes to a single `/v1`. Use a dummy API key on the wire; the bot sends `sk-no-key-required`.
+   ```bash
+   poetry install
+   ```
 
-Web search tools need `llama-server` built with tool support, typically `--jinja`, plus a chat template that matches your GGUF. See the upstream server README and function-calling docs.
+2. Copy **`settings.toml.example`** → **`settings.toml`** and set your Discord **owner** id, **whitelist** guild/channel ids, and other options.
 
-Generation tuning accepts either `temperature` / `repeat_penalty` or the legacy names `ollama_temperature` / `ollama_repeat_penalty`.
+3. Add **`.secrets.toml`** in the project root (not committed; see `.gitignore`) with at least the bot token:
 
+   ```toml
+   [tokens]
+   bot = "<discord bot token>"
+   gpt = "<openai api key, optional>"
+   hf = "<huggingface token, optional>"
+   anthropic = "<anthropic key, optional>"
+   ```
+
+4. From the repo root, run the bot:
+
+   ```bash
+   poetry run python src/sigrok/bot.py
+   ```
+
+   On first run, if `data.db` is missing, the app initializes the database.
+
+5. **Channel permissions** — See [`BOT_PERMISSIONS.md`](BOT_PERMISSIONS.md) so replies can thread correctly.
+
+## Configuration
+
+| File | Purpose |
+|------|---------|
+| `settings.toml` | Bot prefix, cogs, whitelist, `[genai]` model and prompts, ELO/social toggles (local only; gitignored). |
+| `.secrets.toml` | API tokens merged over `settings.toml`. |
+| `resources/sigrok_personality_prompt.txt` | Personality text used for some reply paths (see code). |
+
+Systemd unit examples live under `deploy/systemd/` (e.g. `sigrok.service`, `llama-server.service`).
+
+## Language models (`[genai]`)
+
+In `settings.toml`, `[genai]` selects the backend via the **model prefix**:
+
+- **`ollama/<tag>`** — HTTP `POST {base_url}/api/chat` (default Ollama port `11434`).
+- **`llamacpp/<model_id>`** — OpenAI-compatible `POST .../v1/chat/completions` against [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server` (this repo’s deploy notes often use port `8081` when `8080` is taken).
+
+For llama.cpp, set `base_url` to the server root (e.g. `http://127.0.0.1:8081`) or a URL already ending in `/v1`; the client normalizes to a single `/v1`. A dummy key is fine on the wire; the client may send `sk-no-key-required`.
+
+Web search tooling needs `llama-server` built with tool support (often `--jinja`) and a chat template that matches your GGUF. See upstream server and function-calling docs.
+
+Generation tuning accepts **`temperature`** / **`repeat_penalty`** or the legacy names **`ollama_temperature`** / **`ollama_repeat_penalty`**.
+
+## License
+
+GPLv2 — see [`LICENSE`](LICENSE).
