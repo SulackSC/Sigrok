@@ -7,9 +7,23 @@ Wants=network-online.target
 Type=simple
 User=sulack
 Group=sulack
-WorkingDirectory=/home/sulack/Documents/Sigrok
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/sulack/llamacpp-venv/bin/python -m llama_cpp.server --model /home/ollama/.ollama/models/blobs/sha256-a8cc1361f3145dc01f6d77c6c82c9116b9ffe3c97b34716fe20418455876c40e --model_alias qwen3-14b --host 127.0.0.1 --port 8081 --n_ctx 8192 --n_gpu_layers -1 --tensor_split 0.5 0.5 --n_batch 128 --n_ubatch 128 --api_key sk-no-key-required
+WorkingDirectory=/home/sulack
+ExecStart=/home/sulack/llama.cpp/build/bin/llama-server \
+  -m /home/sulack/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf \
+  --mmproj /home/sulack/models/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf \
+  -a qwen3.6-35b-a3b \
+  --n-gpu-layers 999 \
+  --tensor-split 0.48,0.52 \
+  -c 8192 \
+  -b 512 \
+  -ub 256 \
+  --flash-attn on \
+  --parallel 1 \
+  --host 127.0.0.1 \
+  --port 8081 \
+  --api-key sk-no-key-required \
+  --reasoning off \
+  --reasoning-budget 0
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

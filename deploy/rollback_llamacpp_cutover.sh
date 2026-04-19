@@ -12,7 +12,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart open-webui.service
 
 echo
-echo "Now restore bot settings.toml to Ollama and restart bot:"
-echo "  model = \"ollama/qwen3:14b\""
-echo "  base_url = \"http://127.0.0.1:11434\""
+echo "Rollback bot to prior native llama.cpp (edit settings.toml first if needed):"
+echo "  model = \"llamacpp/qwen3.5-27b\""
+echo "  base_url = \"http://127.0.0.1:8081\""
 echo "  sudo systemctl restart sigrok.service"

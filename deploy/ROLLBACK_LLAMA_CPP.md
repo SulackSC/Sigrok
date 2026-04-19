@@ -3,7 +3,7 @@
 This host currently runs:
 - `sigrok.service` (bot)
 - `open-webui.service` (UI on `:8080`)
-- llama.cpp server on `:8081`
+- llama.cpp **native** `llama-server` on `:8081` (see `/etc/systemd/system/llama-server.service`)
 
 ## 1) Install/enable llama.cpp system service
 
@@ -27,11 +27,14 @@ sudo systemctl status open-webui.service --no-pager
 
 OpenWebUI remains at `http://127.0.0.1:8080` (or LAN IP `:8080`); only model backend changes.
 
-## 3) Bot config already switched to llama.cpp
+## 3) Bot config (llama.cpp)
 
-`settings.toml` is set to:
-- `model = "llamacpp//home/ollama/...sha256-a8cc..."`
-- `base_url = "http://127.0.0.1:8081"`
+`settings.toml` should match the `-a` model alias from `llama-server.service`, e.g.:
+
+```toml
+model = "llamacpp/qwen3.6-35b-a3b"
+base_url = "http://127.0.0.1:8081"
+```
 
 Restart bot when ready:
 
@@ -42,16 +45,37 @@ sudo systemctl status sigrok.service --no-pager
 
 ## Rollback (fast)
 
-### Bot rollback to Ollama
+### Bot rollback to previous native llama.cpp model
 
-Edit `settings.toml` and restore:
+1. Restore the **previous** `llama-server.service` `ExecStart` paths (Qwen3.5-27B GGUF + `-a qwen3.5-27b`), then:
+
+```bash
+sudo install -m 644 /home/sulack/Documents/Sigrok/deploy/systemd/llama-server.service /etc/systemd/system/llama-server.service
+sudo systemctl daemon-reload
+sudo systemctl restart llama-server.service
+```
+
+2. Edit `settings.toml` and restore:
+
+```toml
+model = "llamacpp/qwen3.5-27b"
+base_url = "http://127.0.0.1:8081"
+```
+
+3. Restart the bot:
+
+```bash
+sudo systemctl restart sigrok.service
+```
+
+(If you keep a git branch or backup of `deploy/systemd/llama-server.service` from before the Qwen3.6 cutover, reinstall that file instead of the repo copy.)
+
+### Bot rollback to Ollama (only if Ollama still runs on `:11434`)
 
 ```toml
 model = "ollama/qwen3:14b"
 base_url = "http://127.0.0.1:11434"
 ```
-
-Then:
 
 ```bash
 sudo systemctl restart sigrok.service
