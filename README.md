@@ -1,8 +1,8 @@
 # Sigrok
 
-Sigrok is a **Discord bot** built on [py-cord](https://github.com/Pycord-Development/pycord). It answers when pinged, using a **local or hosted language model** as the brain, with tunable prompts and optional web search. The codebase also includes **debate scoring** (ELO-style per-guild **ratings** when the **`betting`** cog is enabled), **Bluesky** integration, **voice recording** chunks, **scheduled and conditional channel posts**, and **database backups**.
+Sigrok is a **Discord bot** built on [py-cord](https://github.com/Pycord-Development/pycord). It answers when pinged, using a **local or hosted language model** as the brain, with tunable prompts and optional web search. The codebase also includes **Bluesky** integration, **voice recording** chunks, **scheduled and conditional channel posts**, and **database backups**.
 
-Upstream lineage: forked from [BrokenDesign/iqbot](https://github.com/BrokenDesign/iqbot). The legacy `users.iq` column was renamed to **`rating`** (same meaning as upstream ELO-style score).
+Upstream lineage: forked from [BrokenDesign/iqbot](https://github.com/BrokenDesign/iqbot). The legacy `users.iq` column was renamed to **`rating`**; the original IQ-bot wager flow has been removed.
 
 Run **`alembic upgrade head`** after upgrading if you already have a `data.db` from an older checkout.
 
@@ -14,7 +14,6 @@ Run **`alembic upgrade head`** after upgrading if you already have a `data.db` f
 - **Voice** — Chunked recording from voice channels (see `voice_rec` cog).
 - **Automation** — Cron-like and one-shot jobs, join/leave messages, timed posts (`conditional_posts` cog).
 - **Data** — SQLite via SQLAlchemy, Alembic migrations, optional rolling backups (`backup` cog).
-- **Debates / ELO** — Optional **`betting`** cog for wagers and per-user **rating** updates (enable in `[bot] cogs` in `settings.toml`).
 
 ## Requirements
 
@@ -56,7 +55,7 @@ Run **`alembic upgrade head`** after upgrading if you already have a `data.db` f
 
 | File | Purpose |
 |------|---------|
-| `settings.toml` | Bot prefix, cogs, whitelist, `[genai]` model and tuning, ELO/social toggles (local only; gitignored). |
+| `settings.toml` | Bot prefix, cogs, whitelist, `[genai]` model and tuning, social toggles (local only; gitignored). |
 | `.secrets.toml` | API tokens merged over `settings.toml`. |
 | `resources/sigrok_personality_prompt.txt` | Main Discord personality / system text for the model (see code). |
 

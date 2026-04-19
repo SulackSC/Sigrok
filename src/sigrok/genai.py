@@ -1411,62 +1411,6 @@ class GenAIBase:
     async def _build_guild_rating_map(self, message: Message) -> dict[int, int]:
         return await self._build_guild_rating_map_from_guild(message.guild)
 
-    async def _build_debate_payload(
-        self,
-        ctx: ApplicationContext | Reaction,
-        messages: list[Message],
-        participants: list[str],
-        *,
-        topic: Optional[str] = None,
-    ) -> tuple[str, list[str]]:
-        image_source_messages = list(messages)
-        if isinstance(ctx, Reaction) and all(
-            existing.id != ctx.message.id for existing in image_source_messages
-        ):
-            image_source_messages.append(ctx.message)
-        guild = ctx.message.guild if isinstance(ctx, Reaction) else ctx.guild
-        rating_by_user = await self._build_guild_rating_map_from_guild(guild)
-        context_users = self._build_context_users(image_source_messages, rating_by_user)
-        image_indexes, inline_images = await self._collect_inline_images(
-            image_source_messages
-        )
-        payload = self._json_dumps(
-            {
-                "environment": self._build_environment_payload(ctx),
-                "event": {
-                    "type": "debate_resolution",
-                    "participants": participants,
-                    "topic": topic,
-                    "judgement": {
-                        "priority": [
-                            "soundness_and_logical_validity",
-                            "internal_consistency",
-                            "rhetorical_effectiveness",
-                        ],
-                        "allow_general_knowledge": True,
-                        "transcript_claims_must_match_messages": True,
-                    },
-                    "trigger_message": (
-                        self._message_payload(ctx.message, image_indexes, rating_by_user)
-                        if isinstance(ctx, Reaction)
-                        else None
-                    ),
-                },
-                "context_users": context_users,
-                "messages": self._render_message_payloads(
-                    messages, image_indexes, rating_by_user
-                ),
-                "response": {
-                    "kind": "json",
-                    "schema": {
-                        "winner": participants + ["draw", "none"],
-                        "reason": "short in-character explanation",
-                    },
-                },
-            }
-        )
-        return payload, inline_images
-
     @staticmethod
     def _parse_json_response(response: str) -> Optional[dict[str, Any]]:
         text = response.strip()
@@ -1489,40 +1433,6 @@ class GenAIBase:
             if isinstance(parsed, dict):
                 return parsed
         return None
-
-    def _parse_debate_response(
-        self, response: str, participants: list[str]
-    ) -> tuple[str, str]:
-        parsed = self._parse_json_response(response)
-        winner = ""
-        reason = response.strip()
-
-        if parsed is not None:
-            winner = str(parsed.get("winner", "")).strip()
-            reason = str(parsed.get("reason") or reason).strip()
-
-        if not winner:
-            match = re.search(r"winner:\s*([^\n*]+)", response, flags=re.IGNORECASE)
-            if match is not None:
-                winner = match.group(1).strip()
-
-        allowed = {name.lower(): name for name in participants}
-        lowered = winner.lower()
-        if lowered in allowed:
-            normalized_winner = allowed[lowered]
-        elif lowered in {"draw", "none"}:
-            normalized_winner = lowered
-        else:
-            normalized_winner = "error"
-
-        if not reason:
-            reason = "No reasoning provided."
-
-        visible_winner = (
-            normalized_winner if normalized_winner != "error" else "error"
-        )
-        public_response = f"**Winner: {visible_winner}**\n{reason}".strip()
-        return normalized_winner, public_response[:1999]
 
     async def answer_message_question(
         self,
@@ -1549,15 +1459,6 @@ class GenAIBase:
         retry_hint: Optional[str] = None,
     ) -> str:
         raise NotImplementedError("answer_social_question must be implemented by subclasses")
-
-    async def judge_debate(
-        self,
-        ctx: ApplicationContext | Reaction,
-        participants: list[str],
-        topic: Optional[str] = None,
-    ) -> tuple[str, str]:
-        raise NotImplementedError("judge_debate must be implemented by subclasses")
-
 
 class GenAIGpt(GenAIBase):
     client: OpenAI
@@ -1590,45 +1491,6 @@ class GenAIGpt(GenAIBase):
             )
         )
         return messages
-
-    async def judge_debate(
-        self,
-        ctx: ApplicationContext | Reaction,
-        participants: list[str],
-        topic: Optional[str] = None,
-    ) -> tuple[str, str]:
-        messages_for_context = await self._collect_history_messages(
-            ctx.message.channel if isinstance(ctx, Reaction) else ctx.channel,
-            before=datetime.now(),
-            after=datetime.now() - timedelta(minutes=settings.genai.history.minutes),
-            limit=settings.genai.history.messages,
-        )
-
-        if not messages_for_context:
-            logger.warning("No conversation history found.")
-            return "error", "No conversation history available to judge."
-
-        user_payload, inline_images = await self._build_debate_payload(
-            ctx, messages_for_context, participants, topic=topic
-        )
-        try:
-            response = self._request_completion(
-                [
-                    ChatMessage(
-                        role=Role.SYSTEM,
-                        content=self._build_personality_system_prompt("discord"),
-                    ),
-                    ChatMessage(
-                        role=Role.USER,
-                        content=user_payload,
-                        images=inline_images or None,
-                    ),
-                ]
-            )
-            return self._parse_debate_response(response, participants)
-        except Exception as exc:
-            logger.error(f"Error occurred in judge_debate: {exc}")
-            return "error", "An error occurred while judging the debate."
 
     async def answer_message_question(
         self,
@@ -1769,42 +1631,6 @@ class GenAIAnthropic(GenAIBase):
             logger.error(f"Unexpected response format: {response.content}")
             return "No response from Anthropic"
         return response.content[0].text or "No response from Anthropic"
-
-    async def judge_debate(
-        self,
-        ctx: ApplicationContext | Reaction,
-        participants: list[str],
-        topic: Optional[str] = None,
-    ) -> tuple[str, str]:
-        messages_for_context = await self._collect_history_messages(
-            ctx.message.channel if isinstance(ctx, Reaction) else ctx.channel,
-            before=datetime.now(),
-            after=datetime.now() - timedelta(minutes=settings.genai.history.minutes),
-            limit=settings.genai.history.messages,
-        )
-
-        if not messages_for_context:
-            logger.warning("No conversation history found.")
-            return "error", "No conversation history available to judge."
-
-        user_payload, inline_images = await self._build_debate_payload(
-            ctx, messages_for_context, participants, topic=topic
-        )
-        try:
-            response = self._request_completion(
-                [
-                    ChatMessage(
-                        role=Role.USER,
-                        content=user_payload,
-                        images=inline_images or None,
-                    )
-                ],
-                self._build_personality_system_prompt("discord"),
-            )
-            return self._parse_debate_response(response, participants)
-        except Exception as exc:
-            logger.error(f"Error occurred in judge_debate: {exc}")
-            return "error", "An error occurred while judging the debate."
 
     async def answer_message_question(
         self,
@@ -2584,42 +2410,6 @@ class _GenAILocalWithWebTools(GenAIBase):
             + "After using a tool, answer naturally in character and never mention tool names "
             + "or internal schemas."
         )
-
-    async def judge_debate(
-        self,
-        ctx: ApplicationContext | Reaction,
-        participants: list[str],
-        topic: Optional[str] = None,
-    ) -> tuple[str, str]:
-        messages_for_context = await self._collect_history_messages(
-            ctx.message.channel if isinstance(ctx, Reaction) else ctx.channel,
-            before=datetime.now(),
-            after=datetime.now() - timedelta(minutes=settings.genai.history.minutes),
-            limit=settings.genai.history.messages,
-        )
-
-        if not messages_for_context:
-            logger.warning("No conversation history found.")
-            return "error", "No conversation history available to judge."
-
-        user_payload, inline_images = await self._build_debate_payload(
-            ctx, messages_for_context, participants, topic=topic
-        )
-        try:
-            response = await self._request_completion(
-                [
-                    ChatMessage(
-                        role=Role.USER,
-                        content=user_payload,
-                        images=inline_images or None,
-                    )
-                ],
-                self._build_personality_system_prompt("discord"),
-            )
-            return self._parse_debate_response(response, participants)
-        except Exception as exc:
-            logger.error(f"Error occurred in judge_debate: {exc}")
-            return "error", "An error occurred while judging the debate."
 
     async def answer_message_question(
         self,

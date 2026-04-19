@@ -97,11 +97,6 @@ timeout_seconds = 10
 enabled = false
 edit_interval_seconds = 2
 
-
-[elo]
-max_delta = 10
-scale = 500
-
 [social.bluesky]
 enabled = true
 identifier = ""

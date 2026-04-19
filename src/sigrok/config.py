@@ -162,16 +162,10 @@ class GenaiSettings(BaseModel):
     )
 
 
-class EloSettings(BaseModel):
-    scale: int
-    max_delta: int
-
-
 class Settings(BaseSettings):
     database: DatabaseSettings
     bot: BotSettings
     genai: GenaiSettings
-    elo: EloSettings
     tokens: Tokens
     social: SocialSettings = Field(default_factory=SocialSettings)
 

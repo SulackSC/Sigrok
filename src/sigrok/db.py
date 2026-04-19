@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pprint import pformat
-from typing import AsyncIterator, Optional, Sequence
+from typing import AsyncIterator, Optional
 
 from loguru import logger
 from sqlalchemy import String, Text
@@ -36,24 +36,7 @@ class User(Base):
     guild_id: Mapped[int] = mapped_column(index=True)
     user_id: Mapped[int] = mapped_column(index=True)
     rating: Mapped[Optional[int]] = mapped_column(default=100)
-    num_bets: Mapped[int] = mapped_column(default=0)
     is_present: Mapped[bool] = mapped_column(default=True)
-
-    def __repr__(self):
-        return pformat(self.to_dict())
-
-    def to_dict(self) -> dict:
-        return self.__dict__
-
-
-class Bet(Base):
-    __tablename__ = "bets"
-    __allow_unmapped__ = True
-    guild_id: Mapped[int] = mapped_column(index=True)
-    message_id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    timestamp: Mapped[datetime] = mapped_column(default=lambda: datetime.now())
-    user_id_1: Mapped[int] = mapped_column(index=True)
-    user_id_2: Mapped[int] = mapped_column(index=True)
 
     def __repr__(self):
         return pformat(self.to_dict())
@@ -313,33 +296,6 @@ async def remove_user(guild_id: int, user_id: int) -> None:
             logger.info(f"User {user} removed from the database")
         else:
             logger.warning(f"User {user_id} not found in the database")
-
-
-@db_logger
-async def add_bet(bet: Bet) -> None:
-    async with get_session() as session:
-        session.add(bet)
-        await session.commit()
-
-
-@db_logger
-async def read_user_bets(user_id: int) -> Sequence[Bet]:
-    async with get_session() as session:
-        stmt = select(Bet).where(
-            (Bet.user_id_1 == user_id) | (Bet.user_id_2 == user_id)  # type: ignore
-        )
-        result = await session.execute(stmt)
-        bets = result.scalars().all()
-    return bets
-
-
-@db_logger
-async def read_bet(message_id) -> Optional[Bet]:
-    async with get_session() as session:
-        stmt = select(Bet).where(Bet.message_id == message_id)
-        result = await session.execute(stmt)
-        bet = result.scalar_one_or_none()
-    return bet
 
 
 async def async_main():
