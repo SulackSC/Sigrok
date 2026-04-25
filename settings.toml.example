@@ -65,6 +65,8 @@ roles = []
 
 [genai]
 # Active backend (llama.cpp `llama-server` on localhost:8081; alias must match the server's -a flag).
+# Runtime note: recent testing preferred llama.cpp KV cache quantization at Q4_1.
+# Example server flags vary by build; keep tool-capable template support enabled when using web tools.
 model = "llamacpp/qwen3.6-35b-a3b"
 base_url = "http://127.0.0.1:8081"
 temperature = 1.05

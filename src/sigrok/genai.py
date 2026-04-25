@@ -1,8 +1,10 @@
 import asyncio
 import base64
 import io
+import ipaddress
 import json
 import re
+import socket
 import textwrap
 from datetime import datetime, timedelta
 from enum import Enum
@@ -11,8 +13,7 @@ from html import unescape
 from pathlib import Path
 from collections.abc import AsyncIterator
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qs, quote_plus, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 from PIL import Image as PILImage
 
@@ -592,8 +593,14 @@ class GenAIBase:
         ):
             return [], None, ""
 
-        chain_messages = [parent_message]
-        if not source_message.author.bot:
+        ancestors = await self._collect_reference_chain_messages(
+            source_message, bot_user_id, user_ids
+        )
+        chain_messages = list(ancestors) if ancestors else [parent_message]
+        if (
+            not source_message.author.bot
+            and source_message.id not in {message.id for message in chain_messages}
+        ):
             chain_messages.append(source_message)
 
         current_message = source_message
@@ -784,6 +791,10 @@ class GenAIBase:
         if message.author.bot:
             return "Sigrok"
         return message.author.name
+
+    def _display_label(self, message: Message) -> str:
+        display_name = str(getattr(message.author, "display_name", "") or "").strip()
+        return display_name or self._speaker_label(message)
 
     def _message_content(self, message: Message) -> str:
         content = (message.content or "").strip() or "[no text]"
@@ -979,14 +990,24 @@ class GenAIBase:
         speaker = self._speaker_label_with_rating(message, rating_by_user)
         return f"{speaker}: {content}"
 
-    def _format_plain_context_message(self, message: Message) -> str:
+    def _format_plain_context_message(
+        self, message: Message, message_by_id: Optional[dict[int, Message]] = None
+    ) -> str:
         content = self._message_content(message)
         if message.attachments:
             attachment_names = ", ".join(
                 attachment.filename for attachment in message.attachments
             )
             content = f"{content} [attachments: {attachment_names}]"
-        speaker = getattr(message.author, "display_name", None) or self._speaker_label(message)
+        speaker = self._display_label(message)
+        if (
+            message_by_id is not None
+            and message.reference
+            and message.reference.message_id is not None
+        ):
+            parent_message = message_by_id.get(message.reference.message_id)
+            if parent_message is not None:
+                speaker = f"{speaker} (re:{self._display_label(parent_message)})"
         return f"{speaker}: {content}"
 
     def _render_messages(
@@ -1005,10 +1026,13 @@ class GenAIBase:
         return "\n".join(reversed(lines))
 
     def _render_plain_context_messages(self, messages: list[Message]) -> str:
+        message_by_id = {message.id: message for message in messages}
         lines: list[str] = []
         remaining_tokens = self.available_tokens("")
         for message in reversed(messages):
-            formatted_message = self._format_plain_context_message(message)
+            formatted_message = self._format_plain_context_message(
+                message, message_by_id=message_by_id
+            )
             message_tokens = self.count_tokens(formatted_message)
             if remaining_tokens - message_tokens < 0:
                 logger.warning("Not enough tokens available for the plain context message.")
@@ -1739,6 +1763,17 @@ class _GenAILocalWithWebTools(GenAIBase):
     _MAX_TOOL_ROUNDS = 4
     _MAX_TOOL_CALLS_PER_ROUND = 2
     _MAX_SOURCES_IN_REPLY = 3
+    _MAX_FETCH_BYTES = 1_000_000
+    _MAX_SEARCH_HTML_BYTES = 750_000
+    _MAX_REDIRECTS = 3
+    _BLOCKED_HOSTS = {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+        "metadata",
+        "169.254.169.254",
+        "169.254.170.2",
+    }
 
     class _HTMLTextExtractor(HTMLParser):
         _SKIP_TAGS = {"script", "style", "noscript", "nav", "footer", "header", "aside"}
@@ -1993,6 +2028,110 @@ class _GenAILocalWithWebTools(GenAIBase):
             return redirect_target
         return href
 
+    @staticmethod
+    def _normalize_public_url(url: str) -> str:
+        normalized = unescape(url.strip())
+        if normalized.startswith("//"):
+            normalized = f"https:{normalized}"
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return parsed._replace(fragment="").geturl()
+
+    @staticmethod
+    def _is_blocked_ip(ip_text: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip_text)
+        except ValueError:
+            return True
+        if addr.is_loopback or addr.is_private or addr.is_link_local:
+            return True
+        if addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+            return True
+        return False
+
+    async def _validate_public_http_url(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "requires a valid http or https URL"
+        if not host:
+            return "missing hostname"
+        if host in self._BLOCKED_HOSTS:
+            return f"blocked host: {host}"
+        try:
+            host_ips = await asyncio.to_thread(
+                lambda: {
+                    item[4][0]
+                    for item in socket.getaddrinfo(
+                        host, parsed.port or 443, type=socket.SOCK_STREAM
+                    )
+                }
+            )
+        except OSError as exc:
+            return f"failed to resolve host: {exc}"
+        if not host_ips:
+            return "host resolution produced no IPs"
+        for ip_text in host_ips:
+            if self._is_blocked_ip(ip_text):
+                return f"blocked IP target: {ip_text}"
+        return None
+
+    @classmethod
+    def _dedupe_sources(cls, rows: list[dict[str, str]]) -> list[dict[str, str]]:
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in rows:
+            title = str(row.get("title") or "").strip()
+            candidate_url = str(row.get("url") or "").strip()
+            normalized_url = cls._normalize_public_url(candidate_url)
+            if not title or not normalized_url or normalized_url in seen:
+                continue
+            seen.add(normalized_url)
+            deduped.append(
+                {
+                    "title": title,
+                    "url": normalized_url,
+                    "snippet": str(row.get("snippet") or "").strip(),
+                }
+            )
+        return deduped
+
+    async def _request_text_with_limits(
+        self, url: str, *, max_bytes: int
+    ) -> tuple[str, str, str]:
+        timeout_seconds = self.settings.genai.web_search.timeout_seconds
+        headers = {"User-Agent": "Mozilla/5.0"}
+        current_url = url
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for redirect_hops in range(self._MAX_REDIRECTS + 1):
+                policy_error = await self._validate_public_http_url(current_url)
+                if policy_error:
+                    raise ValueError(policy_error)
+                async with session.get(
+                    current_url, headers=headers, allow_redirects=False
+                ) as response:
+                    if 300 <= response.status < 400:
+                        location = response.headers.get("Location", "").strip()
+                        if not location:
+                            raise ValueError("redirect response missing Location header")
+                        if redirect_hops >= self._MAX_REDIRECTS:
+                            raise ValueError("too many redirects")
+                        current_url = urljoin(current_url, location)
+                        continue
+                    if response.status >= 400:
+                        body = (await response.text())[:500]
+                        raise ValueError(f"{response.status} {body}")
+                    body_bytes = await response.content.read(max_bytes + 1)
+                    if len(body_bytes) > max_bytes:
+                        raise ValueError("response exceeds maximum allowed size")
+                    charset = response.charset or "utf-8"
+                    body = body_bytes.decode(charset, "ignore")
+                    content_type = response.headers.get("Content-Type", "")
+                    return current_url, content_type, body
+        raise ValueError("request failed")
+
     @classmethod
     def _parse_duckduckgo_lite_results(
         cls, html_text: str, max_results: int
@@ -2026,7 +2165,8 @@ class _GenAILocalWithWebTools(GenAIBase):
                 results.append({"title": title, "url": url, "snippet": snippet})
             if len(results) >= max_results:
                 break
-        return results
+        deduped = cls._dedupe_sources(results)
+        return deduped[:max_results]
 
     @classmethod
     def _extract_html_title(cls, html_text: str) -> str:
@@ -2043,22 +2183,15 @@ class _GenAILocalWithWebTools(GenAIBase):
         return parser.get_text()
 
     async def _fetch_url(self, url: str) -> str:
-        timeout_seconds = self.settings.genai.web_search.timeout_seconds
-        headers = {"User-Agent": "Mozilla/5.0"}
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return self._json_dumps({"url": url, "error": "fetch_url requires a valid http or https URL"})
+        normalized_url = self._normalize_public_url(url)
+        if not normalized_url:
+            return self._json_dumps(
+                {"url": url, "error": "fetch_url requires a valid http or https URL"}
+            )
 
-        request = Request(url, headers=headers)
-
-        def fetch_response() -> tuple[str, str]:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                content_type = response.headers.get("Content-Type", "")
-                charset = response.headers.get_content_charset() or "utf-8"
-                body = response.read().decode(charset, "ignore")
-                return content_type, body
-
-        content_type, body = await asyncio.to_thread(fetch_response)
+        resolved_url, content_type, body = await self._request_text_with_limits(
+            normalized_url, max_bytes=self._MAX_FETCH_BYTES
+        )
         title = ""
         excerpt = ""
         if "html" in content_type.lower():
@@ -2072,7 +2205,7 @@ class _GenAILocalWithWebTools(GenAIBase):
 
         return self._json_dumps(
             {
-                "url": url,
+                "url": resolved_url,
                 "title": title,
                 "content_type": content_type,
                 "content": excerpt,
@@ -2143,18 +2276,11 @@ class _GenAILocalWithWebTools(GenAIBase):
         if requested_results is not None:
             max_results = max(1, min(requested_results, max_results))
 
-        timeout_seconds = self.settings.genai.web_search.timeout_seconds
-        headers = {"User-Agent": "Mozilla/5.0"}
-
         async def run_search(search_query: str) -> list[dict[str, str]]:
-            url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(search_query)}"
-            request = Request(url, headers=headers)
-
-            def fetch_html() -> str:
-                with urlopen(request, timeout=timeout_seconds) as response:
-                    return response.read().decode("utf-8", "ignore")
-
-            html_text = await asyncio.to_thread(fetch_html)
+            search_url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(search_query)}"
+            _, _, html_text = await self._request_text_with_limits(
+                search_url, max_bytes=self._MAX_SEARCH_HTML_BYTES
+            )
             return self._parse_duckduckgo_lite_results(html_text, max_results)
 
         results = await run_search(query)
@@ -2170,7 +2296,7 @@ class _GenAILocalWithWebTools(GenAIBase):
                     "note": "No web results were found.",
                 }
             )
-        return self._json_dumps({"query": query, "results": results})
+        return self._json_dumps({"query": query, "results": self._dedupe_sources(results)})
 
     async def _execute_parsed_tool(
         self, name: str, arguments: dict[str, Any]
@@ -2236,9 +2362,10 @@ class _GenAILocalWithWebTools(GenAIBase):
         if tool_name == "fetch_url":
             url = str(parsed.get("url") or "").strip()
             title = str(parsed.get("title") or "").strip() or url
-            if not url:
+            normalized_url = self._normalize_public_url(url)
+            if not normalized_url:
                 return []
-            return [{"title": title, "url": url}]
+            return [{"title": title, "url": normalized_url}]
         if tool_name != "search_web":
             return []
         raw_results = parsed.get("results")
@@ -2246,7 +2373,7 @@ class _GenAILocalWithWebTools(GenAIBase):
             return []
 
         sources: list[dict[str, str]] = []
-        for item in raw_results:
+        for item in self._dedupe_sources(raw_results):
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title") or "").strip()

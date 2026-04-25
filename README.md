@@ -74,6 +74,13 @@ Web search tooling needs `llama-server` built with tool support (often `--jinja`
 
 Generation tuning accepts **`temperature`** / **`repeat_penalty`** or the legacy names **`ollama_temperature`** / **`ollama_repeat_penalty`**.
 
+### llama.cpp runtime notes
+
+- The project expects a llama.cpp `llama-server` endpoint compatible with `/v1/chat/completions`.
+- In recent testing, using **Q4_1 KV cache quantization** provided the best memory/perf trade-off for long Discord context windows.
+- Keep your model alias (`llamacpp/<alias>`) aligned with the server `-a` alias; mismatch here looks like model failure from the bot side.
+- If tool calling is enabled, keep a tool-capable server build and compatible chat template; Sigrok now dedupes sources and applies stricter public-URL fetch safeguards before using tool results.
+
 ## License
 
 GPLv2 — see [`LICENSE`](LICENSE).
