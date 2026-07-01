@@ -23,7 +23,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from discord import Member, Message, TextChannel
+from discord import Member, Message, TextChannel, Thread
 from discord.ext import commands, tasks
 from loguru import logger
 
@@ -80,6 +80,7 @@ class ConditionalPosts(commands.Cog):
         self.bot = bot
         self._timed_state: dict[tuple[int, int], datetime] = {}
         self._ack_to_job: dict[int, str] = {}
+        self._cron_failures: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self.scheduler_loop.start()
 
@@ -125,7 +126,7 @@ class ConditionalPosts(commands.Cog):
             if rule.ignore_bots and member.bot:
                 continue
             channel = member.guild.get_channel(rule.channel)
-            if not isinstance(channel, TextChannel):
+            if not isinstance(channel, (TextChannel, Thread)):
                 continue
             try:
                 await channel.send(_format_user_template(rule.message, member))
@@ -164,7 +165,7 @@ class ConditionalPosts(commands.Cog):
                 continue
             if now - last < interval:
                 continue
-            channel = self._resolve_text_channel(rule.guild, rule.channel)
+            channel = self._resolve_postable_channel(rule.guild, rule.channel)
             if channel is None:
                 continue
             try:
@@ -174,71 +175,98 @@ class ConditionalPosts(commands.Cog):
                 logger.warning(f"timed_post send failed guild={rule.guild} channel={rule.channel}: {exc}")
 
     async def _tick_schedule_jobs(self) -> None:
-        now_naive = _to_naive_utc(_now_utc())
         try:
-            jobs = await db.list_schedule_mention_jobs()
+            jobs = await db.read_due_schedule_jobs(_now_utc())
         except Exception as exc:
-            logger.warning(f"list_schedule_mention_jobs failed: {exc}")
+            logger.warning(f"read_due_schedule_jobs failed: {exc}")
             return
         for job in jobs:
             if not self._is_whitelisted_guild(job.guild_id):
                 continue
             if job.kind == "once":
-                if job.due_at is None or job.due_at > now_naive:
-                    continue
                 await self._fire_once_job(job)
             elif job.kind == "cron":
-                if job.next_fire is None or job.next_fire > now_naive:
-                    continue
                 await self._fire_cron_job(job)
             else:
                 logger.warning(f"unknown schedule job kind: {job.kind} (job_id={job.job_id})")
 
+    async def _deliver_job_prompt(self, channel: TextChannel | Thread, job) -> bool:  # type: ignore[no-untyped-def]
+        """Run deferred AI reply on the original schedule message, or fall back to raw send."""
+        source: Optional[Message] = None
+        try:
+            source = await channel.fetch_message(job.message_id)
+        except Exception:
+            source = None
+        misc = self.bot.get_cog("Misc")
+        if misc is None or source is None:
+            try:
+                await channel.send(job.prompt)
+                return True
+            except Exception as exc:
+                logger.warning(f"schedule job fallback send failed job_id={job.job_id}: {exc}")
+                return False
+        try:
+            await misc.run_deferred_mention_reply(source, job.prompt)
+            return True
+        except Exception as exc:
+            logger.warning(f"schedule job deferred reply failed job_id={job.job_id}: {exc}")
+            return False
+
     async def _fire_once_job(self, job) -> None:  # type: ignore[no-untyped-def]
         async with self._lock:
-            try:
-                channel = self._resolve_text_channel(job.guild_id, job.channel_id)
-                if channel is None:
-                    logger.warning(f"once job channel missing guild={job.guild_id} channel={job.channel_id}")
-                    await db.delete_schedule_mention_job(job.job_id)
-                    return
-                source: Optional[Message] = None
-                try:
-                    source = await channel.fetch_message(job.message_id)
-                except Exception:
-                    source = None
-                misc = self.bot.get_cog("Misc")
-                if misc is None or source is None:
-                    try:
-                        await channel.send(job.prompt)
-                    except Exception as exc:
-                        logger.warning(f"once job fallback send failed: {exc}")
-                else:
-                    try:
-                        await misc.run_deferred_mention_reply(source, job.prompt)
-                    except Exception as exc:
-                        logger.warning(f"once job deferred reply failed: {exc}")
-            finally:
+            channel = self._resolve_postable_channel(job.guild_id, job.channel_id)
+            if channel is None:
+                logger.warning(
+                    f"once job channel missing guild={job.guild_id} channel={job.channel_id}"
+                )
+                await db.delete_schedule_mention_job(job.job_id)
+                if job.ack_message_id is not None:
+                    self._ack_to_job.pop(job.ack_message_id, None)
+                return
+
+            delivered = await self._deliver_job_prompt(channel, job)
+
+            if delivered:
                 if job.ack_message_id is not None:
                     self._ack_to_job.pop(job.ack_message_id, None)
                 try:
                     await db.delete_schedule_mention_job(job.job_id)
                 except Exception as exc:
                     logger.warning(f"delete once job failed: {exc}")
+            else:
+                try:
+                    await db.bump_once_schedule_job_due(job.job_id, timedelta(minutes=5))
+                except Exception as exc:
+                    logger.warning(f"bump once job due failed job_id={job.job_id}: {exc}")
 
     async def _fire_cron_job(self, job) -> None:  # type: ignore[no-untyped-def]
         async with self._lock:
-            channel = self._resolve_text_channel(job.guild_id, job.channel_id)
+            channel = self._resolve_postable_channel(job.guild_id, job.channel_id)
+            delivered = False
             if channel is not None:
-                try:
-                    await channel.send(job.prompt)
-                except Exception as exc:
-                    logger.warning(f"cron job send failed job_id={job.job_id}: {exc}")
+                delivered = await self._deliver_job_prompt(channel, job)
+            if not delivered:
+                failures = self._cron_failures.get(job.job_id, 0) + 1
+                self._cron_failures[job.job_id] = failures
+                if failures < 3:
+                    logger.warning(
+                        f"cron job delivery failed job_id={job.job_id} "
+                        f"(attempt {failures}/3); will retry"
+                    )
+                    return
+                logger.warning(
+                    f"cron job delivery failed job_id={job.job_id} after {failures} "
+                    "attempts; advancing schedule anyway"
+                )
+            else:
+                self._cron_failures.pop(job.job_id, None)
+
             next_fire = self._next_cron_fire(job.cron_expr or "", _now_utc())
             if next_fire is None:
                 logger.warning(f"cron job has no next fire, deleting job_id={job.job_id}")
                 if job.ack_message_id is not None:
                     self._ack_to_job.pop(job.ack_message_id, None)
+                self._cron_failures.pop(job.job_id, None)
                 await db.delete_schedule_mention_job(job.job_id)
                 return
             try:
@@ -246,12 +274,15 @@ class ConditionalPosts(commands.Cog):
             except Exception as exc:
                 logger.warning(f"update next_fire failed job_id={job.job_id}: {exc}")
 
-    def _resolve_text_channel(self, guild_id: int, channel_id: int) -> Optional[TextChannel]:
+    def _resolve_postable_channel(
+        self, guild_id: int, channel_id: int
+    ) -> Optional[TextChannel | Thread]:
+        """Guild text channels and threads (forum posts, message threads, etc.)."""
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             return None
         channel = guild.get_channel(channel_id)
-        if isinstance(channel, TextChannel):
+        if isinstance(channel, (TextChannel, Thread)):
             return channel
         return None
 

@@ -12,11 +12,16 @@ trash**
 logs/*
 .env
 .bluesky_state.json
+.x_state.json
 # Local dumps / backups (may contain tokens or PII)
 sigrok_logs.txt
 settings.toml.backup*
 notes.md
 tests/_report.html
+# llama-server is llama.cpp infra, not the bot itself; units hardcode host-specific model paths.
+deploy/systemd/llama-server*.service
+# Scratch/duplicate persona drafts (keep the canonical prompt + versioned backups only).
+resources/sigrok_personality_prompt original.txt
 
 .DS_Store
 .huskyrc.json

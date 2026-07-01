@@ -3,7 +3,7 @@ import gzip
 import os
 import re
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urlparse
 
 import discord
@@ -29,20 +29,28 @@ def create_backup() -> str:
     return filename
 
 
-def remove_old_backups():
-    now = datetime.now()
-    for backup in os.listdir(settings.database.backup_dir):
+def remove_old_backups() -> None:
+    """Keep only the newest `retention` backup files."""
+    backup_dir = settings.database.backup_dir
+    retention = max(0, int(settings.database.retention))
+    backups: list[tuple[float, str]] = []
+    for backup in os.listdir(backup_dir):
+        if not re.match(r"^backup_\d+_\d+\.sqlite3\.gz$", backup):
+            logger.warning(f"Skipping unrecognized backup filename: {backup}")
+            continue
+        full_path = os.path.join(backup_dir, backup)
         try:
-            match = re.search(r"^backup_(\d+_\d+)\.sqlite3\.gz$", backup)
-            if not match:
-                logger.warning(f"Failed to match timestamp in filename: {backup}")
-                continue
-            dt = datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
-            if (now - dt) > timedelta(days=settings.database.retention):
-                os.remove(os.path.join(settings.database.backup_dir, backup))
-                logger.info(f"Deleted old backup: {backup}")
-        except Exception as e:
-            logger.warning(f"Failed to parse or delete backup `{backup}`: {e}")
+            backups.append((os.path.getmtime(full_path), full_path))
+        except OSError as exc:
+            logger.warning(f"Failed to stat backup `{backup}`: {exc}")
+
+    backups.sort(key=lambda row: row[0], reverse=True)
+    for _, path in backups[retention:]:
+        try:
+            os.remove(path)
+            logger.info(f"Deleted old backup: {os.path.basename(path)}")
+        except OSError as exc:
+            logger.warning(f"Failed to delete backup `{path}`: {exc}")
 
 
 class Backup(commands.Cog):
@@ -58,7 +66,7 @@ class Backup(commands.Cog):
     @tasks.loop(hours=24)
     async def backup_task(self):
         try:
-            name = create_backup()
+            name = await asyncio.to_thread(create_backup)
             logger.info(f"Daily backup created: {name}")
         except Exception as e:
             logger.error(f"Scheduled backup failed: {e}")

@@ -28,6 +28,30 @@ from tokenizers import Tokenizer
 from sigrok import db
 from sigrok.config import Settings, settings
 
+_shared_http_session: Optional[aiohttp.ClientSession] = None
+_http_session_lock = asyncio.Lock()
+
+
+async def get_shared_http_session(
+    *, timeout: Optional[aiohttp.ClientTimeout] = None
+) -> aiohttp.ClientSession:
+    global _shared_http_session
+    async with _http_session_lock:
+        if _shared_http_session is None or _shared_http_session.closed:
+            _shared_http_session = aiohttp.ClientSession(timeout=timeout)
+        elif timeout is not None and _shared_http_session.timeout != timeout:
+            await _shared_http_session.close()
+            _shared_http_session = aiohttp.ClientSession(timeout=timeout)
+        return _shared_http_session
+
+
+async def close_shared_http_session() -> None:
+    global _shared_http_session
+    async with _http_session_lock:
+        if _shared_http_session is not None:
+            await _shared_http_session.close()
+            _shared_http_session = None
+
 
 def normalize_llamacpp_openai_base_url(url: str) -> str:
     # OpenAI client base_url must end with exactly one /v1 for llama-server.
@@ -206,6 +230,12 @@ class GenAIBase:
             "GenAIBase is an abstract class and cannot be instantiated directly."
         )
 
+    _STREAMING_PLATFORMS = frozenset({"twitch", "youtube", "kick"})
+
+    @classmethod
+    def _is_streaming_platform(cls, platform: str) -> bool:
+        return platform.strip().lower() in cls._STREAMING_PLATFORMS
+
     @staticmethod
     def _platform_context_system_prompt(platform: str) -> str:
         normalized = platform.strip().lower()
@@ -216,17 +246,49 @@ class GenAIBase:
                 "Think in terms of posts, replies, mentions, handles, and threads.\n"
                 "Do not talk like you are in a Discord server or channel."
             )
+        if normalized in {"x", "twitter"}:
+            return (
+                "[Platform]\n"
+                "You are replying on X (Twitter). Treat this as a public post thread.\n"
+                "Think in terms of posts, replies, mentions, handles, and threads.\n"
+                "Keep replies concise (280 characters max). No markdown.\n"
+                "Do not talk like you are in a Discord server or channel."
+            )
         if normalized == "discord":
             return (
                 "[Platform]\n"
                 "You are replying on Discord. Treat this as a server/channel chat.\n"
-                "Think in terms of messages, replies, mentions, channels, and servers."
+                "Think in terms of messages, replies, mentions, channels, and servers.\n"
+                "You are also super smart at formatting for Discord — spacing, line breaks, "
+                "and readability come naturally without changing how you talk."
+            )
+        if normalized == "twitch":
+            return (
+                "[Platform]\n"
+                "You are replying in a Twitch live chat. Messages are fast, public, and ephemeral.\n"
+                "Keep replies very short (1-2 sentences). No markdown. No bullet lists.\n"
+                "Do not reference Discord servers or channels."
+            )
+        if normalized == "youtube":
+            return (
+                "[Platform]\n"
+                "You are replying in a YouTube live chat. Keep replies very short (1-2 sentences).\n"
+                "No markdown. No bullet lists. Do not reference Discord servers or channels."
+            )
+        if normalized == "kick":
+            return (
+                "[Platform]\n"
+                "You are replying in a Kick live chat. Keep replies very short (1-2 sentences).\n"
+                "No markdown. No bullet lists. Do not reference Discord servers or channels."
             )
         return f"[Platform]\nYou are replying on {platform}."
 
     @staticmethod
     def _current_datetime_system_prompt() -> str:
-        now = datetime.now().astimezone()
+        # Minute precision keeps the prompt prefix byte-stable for up to a minute,
+        # so repeated pings in the same minute can share the provider's prompt cache
+        # instead of busting it on sub-second timestamp churn.
+        now = datetime.now().astimezone().replace(second=0, microsecond=0)
         timezone_name = now.tzname() or "local time"
         return (
             "[Current date and time]\n"
@@ -236,6 +298,31 @@ class GenAIBase:
         )
 
     @classmethod
+    def _static_system_prefix(cls, platform: str = "discord") -> str:
+        """Cache-friendly static prefix: identical across requests on a platform,
+        so the provider's prompt cache can reuse it."""
+        return "\n\n".join(
+            [
+                SIGROK_PERSONALITY_SYSTEM_PROMPT.strip(),
+                cls._platform_context_system_prompt(platform).strip(),
+            ]
+        )
+
+    @classmethod
+    def _dynamic_system_suffix(
+        cls,
+        *,
+        reply_mode: Optional[str] = None,
+        retry_hint: Optional[str] = None,
+    ) -> str:
+        """Per-request dynamic tail (datetime + reply-mode). Kept last so it does
+        not invalidate the stable cache prefix ahead of it."""
+        parts = [cls._current_datetime_system_prompt().strip()]
+        if reply_mode:
+            parts.append(cls._reply_mode_system_block(reply_mode, retry_hint))
+        return "\n\n".join(parts)
+
+    @classmethod
     def _build_personality_system_prompt(
         cls,
         platform: str = "discord",
@@ -243,14 +330,14 @@ class GenAIBase:
         reply_mode: Optional[str] = None,
         retry_hint: Optional[str] = None,
     ) -> str:
-        parts = [
-            SIGROK_PERSONALITY_SYSTEM_PROMPT.strip(),
-            cls._platform_context_system_prompt(platform).strip(),
-            cls._current_datetime_system_prompt().strip(),
-        ]
-        if reply_mode:
-            parts.append(cls._reply_mode_system_block(reply_mode, retry_hint))
-        return "\n\n".join(parts)
+        return "\n\n".join(
+            [
+                cls._static_system_prefix(platform),
+                cls._dynamic_system_suffix(
+                    reply_mode=reply_mode, retry_hint=retry_hint
+                ),
+            ]
+        )
 
     @classmethod
     def _reply_mode_system_block(cls, reply_mode: str, retry_hint: Optional[str] = None) -> str:
@@ -659,6 +746,12 @@ class GenAIBase:
             if len(word) >= 3 and word not in cls._QUESTION_STOP_WORDS
         }
 
+    # Reply modes that warrant deep, time-bounded channel recall (vs. a tight
+    # count-based window for casual/quick/reply-chain pings).
+    _DEEP_CONTEXT_REPLY_MODES = frozenset(
+        {"serious_discussion", "discussion", "direct_question"}
+    )
+
     @classmethod
     def _classify_mention_reply_mode(
         cls,
@@ -730,6 +823,73 @@ class GenAIBase:
         if mode in {"quick_question", "ambiguous_followup"}:
             return min(default_limit, 3)
         return default_limit
+
+    # Phrases that mean "tell me about this channel/conversation itself", which
+    # should pull deep channel history even when sent as a reply (reply_chain).
+    # Mirrors the catch-up exception described in the mention payload instructions.
+    _CATCH_UP_PATTERNS = (
+        r"what'?s? (?:going on|up|happening)",
+        r"catch (?:me )?up",
+        r"caught? up",
+        r"summar(?:y|ise|ize)",
+        r"recap",
+        r"\btl;?dr\b",
+        r"who said what",
+        r"what did i miss",
+        r"what have i missed",
+        r"fill me in",
+        r"(?:oldest|earliest|first|most recent|latest|last) (?:message|msg|thing)",
+        r"what'?s? been (?:said|discussed|happening)",
+        r"rundown",
+        r"bring me up to speed",
+    )
+
+    @classmethod
+    def _is_catch_up_question(cls, question: str) -> bool:
+        lowered = (question or "").strip().lower()
+        if not lowered:
+            return False
+        return any(re.search(pat, lowered) for pat in cls._CATCH_UP_PATTERNS)
+
+    def _select_context_plan(
+        self,
+        question: str,
+        *,
+        has_reference: bool,
+        retry_hint: Optional[str],
+        recent_context_human_turns: Optional[int],
+    ) -> tuple[str, int, Optional[int]]:
+        """Single source of truth for reply mode, context turn limit, and the
+        optional time-bounded history window. Shared by the normal and streaming
+        Discord answer paths so they cannot drift apart."""
+        reply_mode = self._classify_mention_reply_mode(
+            question, has_reference=has_reference, retry_hint=retry_hint
+        )
+
+        if recent_context_human_turns is not None:
+            # Caller pinned the window explicitly (e.g. deferred @schedule jobs).
+            return reply_mode, recent_context_human_turns, None
+
+        default_limit = settings.genai.question.recent_messages
+        history_minutes = settings.genai.history.minutes
+
+        # Catch-up / "what's going on" questions get the deep time-bounded window
+        # even inside a reply chain, where they would otherwise be capped at 2 turns.
+        if self._is_catch_up_question(question):
+            return reply_mode, default_limit, history_minutes
+
+        ctx_limit = self._mention_context_limit(
+            question,
+            default_limit,
+            has_reference=has_reference,
+            retry_hint=retry_hint,
+        )
+        deep_minutes = (
+            history_minutes
+            if reply_mode in self._DEEP_CONTEXT_REPLY_MODES
+            else None
+        )
+        return reply_mode, ctx_limit, deep_minutes
 
     @classmethod
     def _mention_length_hint(cls, reply_mode: str) -> str:
@@ -842,14 +1002,16 @@ class GenAIBase:
 
     async def _download_image_url(self, url: str) -> Optional[bytes]:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.read()
-                    if len(data) > self._MAX_INLINE_IMAGE_BYTES:
-                        return None
-                    return data
+            session = await get_shared_http_session(
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                if len(data) > self._MAX_INLINE_IMAGE_BYTES:
+                    return None
+                return data
         except Exception as exc:
             logger.warning(f"Failed to download embed image {url}: {exc}")
             return None
@@ -1011,13 +1173,22 @@ class GenAIBase:
         return f"{speaker}: {content}"
 
     def _render_messages(
-        self, messages: list[Message], rating_by_user: Optional[dict[int, int]] = None
+        self,
+        messages: list[Message],
+        rating_by_user: Optional[dict[int, int]] = None,
+        token_counts: Optional[dict[int, int]] = None,
     ) -> str:
         lines: list[str] = []
         remaining_tokens = self.available_tokens("")
         for message in reversed(messages):
             formatted_message = self.format_message(message, rating_by_user)
-            message_tokens = self.count_tokens(formatted_message)
+            message_tokens = (
+                token_counts.get(message.id)
+                if token_counts is not None
+                else self.count_tokens(formatted_message)
+            )
+            if message_tokens is None:
+                message_tokens = self.count_tokens(formatted_message)
             if remaining_tokens - message_tokens < 0:
                 logger.warning("Not enough tokens available for the message.")
                 continue
@@ -1069,8 +1240,9 @@ class GenAIBase:
         after: datetime,
         limit: int,
         include_bots: bool = False,
-    ) -> list[Message]:
+    ) -> tuple[list[Message], dict[int, int]]:
         messages: list[Message] = []
+        token_counts: dict[int, int] = {}
         context_tokens = self.available_tokens("")
         async for message in channel.history(
             before=before,
@@ -1089,9 +1261,11 @@ class GenAIBase:
                 break
 
             context_tokens -= message_tokens
+            token_counts[message.id] = message_tokens
             messages.append(message)
 
-        return list(reversed(messages))
+        ordered = list(reversed(messages))
+        return ordered, {mid: token_counts[mid] for mid in (m.id for m in ordered)}
 
     def _eligible_for_transcript(
         self,
@@ -1178,21 +1352,34 @@ class GenAIBase:
         history_before: Optional[datetime] = None,
         *,
         merge_reply_chain: bool = True,
+        history_minutes: Optional[int] = None,
     ) -> list[Message]:
-        """Build transcript: last `limit` human turns plus interleaved Sigrok replies (chronological)."""
+        """Build transcript context (chronological).
+
+        Count-based by default: last `limit` human turns plus interleaved Sigrok
+        replies. When `history_minutes` is set, switch to a time-bounded window
+        reaching back that many minutes so "what's going on" style questions get
+        day-scale recall; the token budget in the render step trims oldest-first
+        if the window exceeds it.
+        """
         guild = source_message.guild
         bot_user_id: Optional[int] = guild.me.id if guild and guild.me else None
 
         raw: list[Message] = []
-        history_limit = max(limit * 3, 20)
         before_anchor = (
             history_before if history_before is not None else source_message.created_at
         )
-        async for message in source_message.channel.history(
-            before=before_anchor,
-            limit=history_limit,
-            oldest_first=False,
-        ):
+        time_bounded = history_minutes is not None and history_minutes > 0
+        history_kwargs: dict[str, Any] = {
+            "before": before_anchor,
+            "oldest_first": False,
+        }
+        if time_bounded:
+            history_kwargs["after"] = before_anchor - timedelta(minutes=history_minutes)
+            history_kwargs["limit"] = max(limit * 3, settings.genai.history.messages, 20)
+        else:
+            history_kwargs["limit"] = max(limit * 3, 20)
+        async for message in source_message.channel.history(**history_kwargs):
             raw.append(message)
         raw.reverse()
 
@@ -1202,14 +1389,19 @@ class GenAIBase:
                 continue
             eligible.append(message)
 
-        window: list[Message] = []
-        humans = 0
-        for message in reversed(eligible):
-            window.insert(0, message)
-            if not message.author.bot:
-                humans += 1
-                if humans >= limit:
-                    break
+        if time_bounded:
+            # Keep the whole time window; the render step's token budget trims
+            # oldest-first if it overflows.
+            window: list[Message] = list(eligible)
+        else:
+            window = []
+            humans = 0
+            for message in reversed(eligible):
+                window.insert(0, message)
+                if not message.author.bot:
+                    humans += 1
+                    if humans >= limit:
+                        break
 
         by_id: dict[int, Message] = {m.id: m for m in window}
 
@@ -1240,41 +1432,41 @@ class GenAIBase:
             logger.error("Invalid context type provided.")
             return ""
 
-        messages = await self._collect_history_messages(
+        messages, token_counts = await self._collect_history_messages(
             channel,
             before=datetime.now(),
             after=datetime.now() - timedelta(minutes=settings.genai.history.minutes),
             limit=settings.genai.history.messages,
         )
-        return self._render_messages(messages)
+        return self._render_messages(messages, token_counts=token_counts)
 
     async def read_current_context(self, ctx: ApplicationContext) -> str:
-        messages = await self._collect_history_messages(
+        messages, token_counts = await self._collect_history_messages(
             ctx.channel,
             before=datetime.now(),
             after=datetime.now() - timedelta(minutes=settings.genai.history.minutes),
             limit=settings.genai.history.messages,
         )
-        return self._render_messages(messages)
+        return self._render_messages(messages, token_counts=token_counts)
 
     async def read_message_context(self, msg: Message) -> str:
-        messages = await self._collect_history_messages(
+        messages, token_counts = await self._collect_history_messages(
             msg.channel,
             before=msg.created_at,
             after=msg.created_at - timedelta(minutes=settings.genai.history.minutes),
             limit=settings.genai.history.messages,
         )
-        return self._render_messages(messages)
+        return self._render_messages(messages, token_counts=token_counts)
 
     async def read_reaction_context(self, reaction: Reaction) -> str:
-        messages = await self._collect_history_messages(
+        messages, token_counts = await self._collect_history_messages(
             reaction.message.channel,
             before=reaction.message.created_at,
             after=reaction.message.created_at
             - timedelta(minutes=settings.genai.history.minutes),
             limit=settings.genai.history.messages,
         )
-        return self._render_messages(messages)
+        return self._render_messages(messages, token_counts=token_counts)
 
     def _build_environment_payload(
         self, ctx: ApplicationContext | Reaction | Message
@@ -1382,8 +1574,13 @@ class GenAIBase:
         surrounding_image_context = self._render_surrounding_image_payloads(
             surrounding_messages, image_indexes
         )
-        rating_by_user = await self._build_guild_rating_map(message)
-        context_users = self._build_context_users(context_source_messages)
+        rating_messages = list(
+            {m.id: m for m in messages + focus_messages + chain_messages + [message]}.values()
+        )
+        rating_by_user = await self._build_guild_rating_map(message, rating_messages)
+        context_users = self._build_context_users(
+            context_source_messages, rating_by_user=rating_by_user
+        )
         rating_reference_note = self._format_rating_reference_note(
             context_users, rating_by_user
         )
@@ -1392,6 +1589,12 @@ class GenAIBase:
                 "environment": self._build_environment_payload(message),
                 "instructions": [
                     "Answer current_message. surrounding_transcript is background only.",
+                    "Exception: if current_message asks about this channel or conversation "
+                    "itself (e.g. what's going on, catch me up, summarize, who said what, "
+                    "the oldest/earliest or most recent message), treat surrounding_transcript "
+                    "as the primary source. Read it and quote or summarize directly. The "
+                    "transcript here is real channel history that was fetched for you, so do "
+                    "not claim you lack access to it or that you only see what was 'passed' to you.",
                     "Need fresh info or sources? Call search_web/fetch_url first. Never invent URLs.",
                 ],
                 "event": {
@@ -1423,17 +1626,33 @@ class GenAIBase:
         payload = "\n\n".join(part for part in payload_parts if part)
         return payload, inline_images, resolved_reply_mode
 
-    async def _build_guild_rating_map_from_guild(self, guild: Any) -> dict[int, int]:
+    @staticmethod
+    def _collect_human_user_ids(messages: list[Message]) -> list[int]:
+        user_ids: set[int] = set()
+        for msg in messages:
+            if not msg.author.bot:
+                user_ids.add(msg.author.id)
+            for mentioned in getattr(msg, "mentions", []):
+                if not getattr(mentioned, "bot", False):
+                    user_ids.add(mentioned.id)
+        return sorted(user_ids)
+
+    async def _build_guild_rating_map(
+        self, message: Message, context_messages: Optional[list[Message]] = None
+    ) -> dict[int, int]:
+        guild = message.guild
         if guild is None:
             return {}
-        users = await db.read_present_users(guild.id)
+        user_ids = self._collect_human_user_ids(context_messages or [])
+        if not message.author.bot:
+            user_ids = sorted(set(user_ids) | {message.author.id})
+        if not user_ids:
+            return {}
+        users = await db.read_users_by_ids(guild.id, user_ids)
         return {
             user.user_id: (user.rating if user.rating is not None else 100)
             for user in users
         }
-
-    async def _build_guild_rating_map(self, message: Message) -> dict[int, int]:
-        return await self._build_guild_rating_map_from_guild(message.guild)
 
     @staticmethod
     def _parse_json_response(response: str) -> Optional[dict[str, Any]]:
@@ -1558,7 +1777,8 @@ class GenAIGpt(GenAIBase):
             retry_hint=retry_hint,
         )
         try:
-            response = self._request_completion(
+            response = await asyncio.to_thread(
+                self._request_completion,
                 [
                     ChatMessage(
                         role=Role.SYSTEM,
@@ -1571,7 +1791,7 @@ class GenAIGpt(GenAIBase):
                         content=user_payload,
                         images=inline_images or None,
                     ),
-                ]
+                ],
             )
             return response
         except Exception as exc:
@@ -1604,7 +1824,8 @@ class GenAIGpt(GenAIBase):
             retry_hint=retry_hint,
         )
         try:
-            response = self._request_completion(
+            response = await asyncio.to_thread(
+                self._request_completion,
                 [
                     ChatMessage(
                         role=Role.SYSTEM,
@@ -1616,7 +1837,7 @@ class GenAIGpt(GenAIBase):
                         role=Role.USER,
                         content=user_payload,
                     ),
-                ]
+                ],
             )
             return response
         except Exception as exc:
@@ -1698,7 +1919,8 @@ class GenAIAnthropic(GenAIBase):
             retry_hint=retry_hint,
         )
         try:
-            response = self._request_completion(
+            response = await asyncio.to_thread(
+                self._request_completion,
                 [
                     ChatMessage(
                         role=Role.USER,
@@ -1741,7 +1963,8 @@ class GenAIAnthropic(GenAIBase):
             retry_hint=retry_hint,
         )
         try:
-            response = self._request_completion(
+            response = await asyncio.to_thread(
+                self._request_completion,
                 [
                     ChatMessage(
                         role=Role.USER,
@@ -2104,32 +2327,32 @@ class _GenAILocalWithWebTools(GenAIBase):
         headers = {"User-Agent": "Mozilla/5.0"}
         current_url = url
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for redirect_hops in range(self._MAX_REDIRECTS + 1):
-                policy_error = await self._validate_public_http_url(current_url)
-                if policy_error:
-                    raise ValueError(policy_error)
-                async with session.get(
-                    current_url, headers=headers, allow_redirects=False
-                ) as response:
-                    if 300 <= response.status < 400:
-                        location = response.headers.get("Location", "").strip()
-                        if not location:
-                            raise ValueError("redirect response missing Location header")
-                        if redirect_hops >= self._MAX_REDIRECTS:
-                            raise ValueError("too many redirects")
-                        current_url = urljoin(current_url, location)
-                        continue
-                    if response.status >= 400:
-                        body = (await response.text())[:500]
-                        raise ValueError(f"{response.status} {body}")
-                    body_bytes = await response.content.read(max_bytes + 1)
-                    if len(body_bytes) > max_bytes:
-                        raise ValueError("response exceeds maximum allowed size")
-                    charset = response.charset or "utf-8"
-                    body = body_bytes.decode(charset, "ignore")
-                    content_type = response.headers.get("Content-Type", "")
-                    return current_url, content_type, body
+        session = await get_shared_http_session(timeout=timeout)
+        for redirect_hops in range(self._MAX_REDIRECTS + 1):
+            policy_error = await self._validate_public_http_url(current_url)
+            if policy_error:
+                raise ValueError(policy_error)
+            async with session.get(
+                current_url, headers=headers, allow_redirects=False
+            ) as response:
+                if 300 <= response.status < 400:
+                    location = response.headers.get("Location", "").strip()
+                    if not location:
+                        raise ValueError("redirect response missing Location header")
+                    if redirect_hops >= self._MAX_REDIRECTS:
+                        raise ValueError("too many redirects")
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status >= 400:
+                    body = (await response.text())[:500]
+                    raise ValueError(f"{response.status} {body}")
+                body_bytes = await response.content.read(max_bytes + 1)
+                if len(body_bytes) > max_bytes:
+                    raise ValueError("response exceeds maximum allowed size")
+                charset = response.charset or "utf-8"
+                body = body_bytes.decode(charset, "ignore")
+                content_type = response.headers.get("Content-Type", "")
+                return current_url, content_type, body
         raise ValueError("request failed")
 
     @classmethod
@@ -2212,6 +2435,30 @@ class _GenAILocalWithWebTools(GenAIBase):
             }
         )
 
+    def _log_completion_usage(self, source: str, round_idx: int, response: Any) -> None:
+        """Log OpenAI-compatible usage, including DeepSeek prompt-cache hit/miss
+        tokens when the backend reports them. Tolerant of proxies that omit fields."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+
+        def _u(name: str) -> Any:
+            val = getattr(usage, name, None)
+            if val is None and getattr(usage, "model_extra", None):
+                val = (usage.model_extra or {}).get(name)
+            return val
+
+        logger.info(
+            "completion_usage "
+            f"source={source} round={round_idx} "
+            f"model={self.settings.genai.model} "
+            f"prompt_tokens={_u('prompt_tokens')} "
+            f"completion_tokens={_u('completion_tokens')} "
+            f"total_tokens={_u('total_tokens')} "
+            f"prompt_cache_hit_tokens={_u('prompt_cache_hit_tokens')} "
+            f"prompt_cache_miss_tokens={_u('prompt_cache_miss_tokens')}"
+        )
+
     def _build_tools(self) -> list[dict[str, Any]]:
         if not self.settings.genai.web_search.enabled:
             return []
@@ -2222,8 +2469,11 @@ class _GenAILocalWithWebTools(GenAIBase):
                     "name": "search_web",
                     "description": (
                         "Search the public web for current or external information and "
-                        "return a few relevant results with snippets. Use for time-sensitive "
-                        "or verifiable facts (news, stats, dates, current heads of state, etc.)."
+                        "return a few relevant results with snippets. Treat results as leads, "
+                        "not proof: if the results are adjacent, stale, vague, or do not directly "
+                        "answer the user's claim, search again with a better query. Use for "
+                        "time-sensitive or verifiable facts (news, stats, dates, current heads "
+                        "of state, identities, claims users ask you to check, etc.)."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2234,6 +2484,9 @@ class _GenAILocalWithWebTools(GenAIBase):
                                 "description": (
                                     "The search query to look up on the web. Do not invent "
                                     "specific years or dates unless the user provided them. "
+                                    "Start broad enough to find the topic; refine with names, "
+                                    "claim terms, quoted phrases, or source-specific operators "
+                                    "when the first results are only loosely related. "
                                     "When a narrower source would help, use operators like "
                                     "site:github.com, site:wikipedia.org, or "
                                     "site:docs.python.org."
@@ -2252,8 +2505,9 @@ class _GenAILocalWithWebTools(GenAIBase):
                 "function": {
                     "name": "fetch_url",
                     "description": (
-                        "Fetch a public URL and return readable page text so you can answer "
-                        "questions about a user-provided link."
+                        "Fetch a public URL and return readable page text. Use this when a "
+                        "search result looks promising enough that the snippet alone is not "
+                        "evidence, or when the user asks about a specific link or its claims."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2421,20 +2675,96 @@ class _GenAILocalWithWebTools(GenAIBase):
         r"""(\w+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^,]+?))(?=\s*,|\s*$)""",
         flags=re.DOTALL,
     )
+    _DSML_TOOL_CALLS_RE = re.compile(
+        r"<\|+DSML\|+tool_calls>.*?</\|+DSML\|+tool_calls>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    _DSML_INVOKE_RE = re.compile(
+        r'<\|+DSML\|+invoke\s+name="([^"]+)"\s*>(.*?)<\s*/\|+DSML\|+invoke>',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    _DSML_PARAM_RE = re.compile(
+        r'<\|+DSML\|+parameter\s+name="([^"]+)"[^>]*>(.*?)<\s*/\|+DSML\|+parameter>',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
     @staticmethod
-    def _strip_tool_call_blocks(content: str) -> str:
+    def _normalize_tool_markup_text(content: str) -> str:
+        text = content.replace("\uFF5C", "|")
+        text = re.sub(r"<\s*\|+", "<|", text)
+        text = re.sub(r"\|\s*>", "|>", text)
+        text = re.sub(r"</\s*\|+", "</|", text)
+        return text
+
+    @classmethod
+    def _strip_tool_call_blocks(cls, content: str) -> str:
+        text = cls._normalize_tool_markup_text(content)
+        cleaned = cls._DSML_TOOL_CALLS_RE.sub("", text)
+        cleaned = re.sub(
+            r"<\|+DSML\|+invoke.*?</\|+DSML\|+invoke>",
+            "",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         cleaned = re.sub(
             r"<tool_call>\s*\{.*?\}\s*</tool_call>",
             "",
-            content,
+            cleaned,
             flags=re.DOTALL | re.IGNORECASE,
         )
-        cleaned = _GenAILocalWithWebTools._PY_TOOL_CALL_RE.sub("", cleaned)
+        cleaned = cls._PY_TOOL_CALL_RE.sub("", cleaned)
         return cleaned.strip()
+
+    @classmethod
+    def _looks_like_leaked_tool_markup(cls, content: str) -> bool:
+        if not content.strip():
+            return False
+        normalized = cls._normalize_tool_markup_text(content)
+        if re.search(r"DSML.*invoke", normalized, flags=re.IGNORECASE):
+            return True
+        if "<tool_call>" in normalized.lower():
+            return True
+        return not cls._strip_tool_call_blocks(content)
+
+    def _parse_dsml_tool_calls(self, content: str) -> list[dict[str, Any]]:
+        text = self._normalize_tool_markup_text(content)
+        parsed_calls: list[dict[str, Any]] = []
+        for idx, invoke in enumerate(self._DSML_INVOKE_RE.finditer(text)):
+            name = invoke.group(1).strip().lower()
+            if name not in {"search_web", "fetch_url"}:
+                continue
+            body = invoke.group(2)
+            args_dict: dict[str, Any] = {}
+            for param in self._DSML_PARAM_RE.finditer(body):
+                key = param.group(1).strip()
+                val = param.group(2).strip()
+                if not key or not val:
+                    continue
+                if key == "max_results" and val.isdigit():
+                    args_dict[key] = int(val)
+                else:
+                    args_dict[key] = val
+            if name == "search_web" and "query" not in args_dict:
+                continue
+            if name == "fetch_url" and "url" not in args_dict:
+                continue
+            parsed_calls.append(
+                {
+                    "id": f"inline-dsml-{idx}",
+                    "name": name,
+                    "arguments": args_dict,
+                }
+            )
+            if len(parsed_calls) >= self._MAX_TOOL_CALLS_PER_ROUND:
+                break
+        return parsed_calls
 
     def _parse_inline_tool_calls(self, content: str) -> list[dict[str, Any]]:
         parsed_calls: list[dict[str, Any]] = []
+        parsed_calls.extend(self._parse_dsml_tool_calls(content))
+        if len(parsed_calls) >= self._MAX_TOOL_CALLS_PER_ROUND:
+            return parsed_calls[: self._MAX_TOOL_CALLS_PER_ROUND]
+
         blocks = re.findall(
             r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
             content,
@@ -2507,36 +2837,51 @@ class _GenAILocalWithWebTools(GenAIBase):
         reply_mode: Optional[str] = None,
         retry_hint: Optional[str] = None,
     ) -> str:
-        prompt = self._build_personality_system_prompt(
-            platform, reply_mode=reply_mode, retry_hint=retry_hint
+        # Order for cache friendliness: static prefix (personality + platform +
+        # tool-use) first, dynamic tail (datetime + reply-mode) last.
+        prompt = self._static_system_prefix(platform)
+        if tools_enabled:
+            prompt += (
+                "\n\n[Tool Use]\n"
+                + "You must call search_web when the user asks for current events, live facts, "
+                + "official information, stats, dates, who currently holds office (for example "
+                + "the president or head of state of a country), or other externally verifiable "
+                + "facts that are not fully grounded in the chat transcript. Do not answer those "
+                + "from memory alone. "
+                + "When the current message, the replied-to message, or the immediate thread includes "
+                + "a public URL and the user is asking about that link or its claims, call fetch_url "
+                + "and read it before answering. "
+                + "Do not tell the user to wait while you search or verify. If lookup is needed, "
+                + "call the tool in this turn instead of narrating that you are checking; the user "
+                + "should see the answer after the lookup, not a placeholder. "
+                + "For casual opinions, jokes, or purely conversational replies that do not depend "
+                + "on external facts, do not use search_web. "
+                + "Search is iterative: the first result set is just the first lead. After a search, "
+                + "check whether the titles and snippets actually address the user's claim, identity, "
+                + "stat, date, or source request. If they are only adjacent, generic, stale, or about "
+                + "the wrong thing, call search_web again with a sharper query instead of treating "
+                + "weak results as proof. "
+                + "For specific factual claims, prefer a follow-up query that includes the key claim "
+                + "terms or an exact quoted phrase; for official facts, prefer the official site or "
+                + "primary source. "
+                + "When a result looks like the source you need but the snippet is not enough to "
+                + "support a strong answer, call fetch_url and read the page before leaning on it. "
+                + "If a question is broad, technical, or could be answered from more than one angle, "
+                + "you may call search_web twice in the same round with two meaningfully different "
+                + "queries instead of waiting to fail first. Prefer complementary angles over "
+                + "near-duplicate rewordings. "
+                + "When building a search query, do not assume a year or date unless the user "
+                + "explicitly gave one. "
+                + "When you need official docs, factual references, or higher-signal technical "
+                + "results, narrow the query with site: operators such as site:github.com, "
+                + "site:wikipedia.org, or site:docs.python.org. "
+                + "After using a tool, answer naturally in character and never mention tool names "
+                + "or internal schemas."
+            )
+        prompt += "\n\n" + self._dynamic_system_suffix(
+            reply_mode=reply_mode, retry_hint=retry_hint
         )
-        if not tools_enabled:
-            return prompt
-        return (
-            prompt
-            + "\n\n[Tool Use]\n"
-            + "You must call search_web when the user asks for current events, live facts, "
-            + "official information, stats, dates, who currently holds office (for example "
-            + "the president or head of state of a country), or other externally verifiable "
-            + "facts that are not fully grounded in the chat transcript. Do not answer those "
-            + "from memory alone. "
-            + "When the current message, the replied-to message, or the immediate thread includes "
-            + "a public URL and the user is asking about that link or its claims, call fetch_url "
-            + "and read it before answering. "
-            + "For casual opinions, jokes, or purely conversational replies that do not depend "
-            + "on external facts, do not use search_web. "
-            + "If a question is broad, technical, or could be answered from more than one angle, "
-            + "you may call search_web twice in the same round with two meaningfully different "
-            + "queries instead of waiting to fail first. Prefer complementary angles over "
-            + "near-duplicate rewordings. "
-            + "When building a search query, do not assume a year or date unless the user "
-            + "explicitly gave one. "
-            + "When you need official docs, factual references, or higher-signal technical "
-            + "results, narrow the query with site: operators such as site:github.com, "
-            + "site:wikipedia.org, or site:docs.python.org. "
-            + "After using a tool, answer naturally in character and never mention tool names "
-            + "or internal schemas."
-        )
+        return prompt
 
     async def answer_message_question(
         self,
@@ -2550,8 +2895,14 @@ class _GenAILocalWithWebTools(GenAIBase):
         merge_reply_chain: bool = True,
     ) -> str:
         has_reference = bool(message.reference and message.reference.message_id)
-        reply_mode = self._classify_mention_reply_mode(
-            question, has_reference=has_reference, retry_hint=retry_hint
+        # Deep/serious questions and catch-up ("what's going on in here") pings reach
+        # back a real time window instead of a fixed turn count; casual/quick pings
+        # stay count-bounded and tight. Shared with the streaming path.
+        reply_mode, _ctx_limit, history_minutes = self._select_context_plan(
+            question,
+            has_reference=has_reference,
+            retry_hint=retry_hint,
+            recent_context_human_turns=recent_context_human_turns,
         )
         has_image_attachments = self._VISION_ENABLED and self._message_has_images(message)
         if not has_image_attachments and has_reference and self._VISION_ENABLED:
@@ -2568,22 +2919,24 @@ class _GenAILocalWithWebTools(GenAIBase):
             )
             if len(chain) > 3:
                 chain = chain[-3:]
-            messages_for_context = chain
-            if has_reference:
-                messages_for_context = list(messages_for_context)
-                if message.id not in {m.id for m in messages_for_context}:
-                    messages_for_context.append(message)
-        else:
-            _ctx_limit = (
-                recent_context_human_turns
-                if recent_context_human_turns is not None
-                else self._mention_context_limit(
-                    question,
-                    settings.genai.question.recent_messages,
-                    has_reference=has_reference,
-                    retry_hint=retry_hint,
-                )
+            recent_messages = await self._collect_recent_context_messages(
+                message,
+                _ctx_limit,
+                user_ids=user_ids,
+                include_current=has_reference,
+                history_before=history_before,
+                merge_reply_chain=merge_reply_chain,
+                history_minutes=history_minutes,
             )
+            messages_by_id: dict[int, Message] = {m.id: m for m in recent_messages}
+            for chain_message in chain:
+                messages_by_id[chain_message.id] = chain_message
+            if has_reference:
+                messages_by_id[message.id] = message
+            messages_for_context = sorted(
+                messages_by_id.values(), key=lambda m: (m.created_at, m.id)
+            )
+        else:
             messages_for_context = await self._collect_recent_context_messages(
                 message,
                 _ctx_limit,
@@ -2591,6 +2944,7 @@ class _GenAILocalWithWebTools(GenAIBase):
                 include_current=has_reference,
                 history_before=history_before,
                 merge_reply_chain=merge_reply_chain,
+                history_minutes=history_minutes,
             )
         user_payload, inline_images, resolved_reply_mode = await self._build_mention_reply_payload(
             message,
@@ -2663,7 +3017,8 @@ class _GenAILocalWithWebTools(GenAIBase):
             reply_mode=reply_mode,
             retry_hint=retry_hint,
         )
-        tools = self._build_tools()
+        streaming = self._is_streaming_platform(platform)
+        tools = [] if streaming else self._build_tools()
         try:
             response = await self._request_completion(
                 [
@@ -2700,61 +3055,61 @@ class GenAIOllama(_GenAILocalWithWebTools):
 
             url = f"{self.settings.genai.base_url.rstrip('/')}/api/chat"
             timeout = aiohttp.ClientTimeout(total=float(self.settings.genai.request_timeout))
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for round_idx in range(self._MAX_TOOL_ROUNDS + 1):
-                    num_predict = max(self.settings.genai.tokens.output_max, 2048)
-                    payload = {
-                        "model": self.settings.genai.model,
-                        "messages": payload_messages,
-                        "stream": False,
-                        "options": {
-                            "num_predict": num_predict,
-                            "temperature": self.settings.genai.temperature,
-                            "repeat_penalty": self.settings.genai.repeat_penalty,
-                        },
-                    }
-                    if tools:
-                        payload["tools"] = tools
+            session = await get_shared_http_session(timeout=timeout)
+            for round_idx in range(self._MAX_TOOL_ROUNDS + 1):
+                num_predict = max(self.settings.genai.tokens.output_max, 2048)
+                payload = {
+                    "model": self.settings.genai.model,
+                    "messages": payload_messages,
+                    "stream": False,
+                    "options": {
+                        "num_predict": num_predict,
+                        "temperature": self.settings.genai.temperature,
+                        "repeat_penalty": self.settings.genai.repeat_penalty,
+                    },
+                }
+                if tools:
+                    payload["tools"] = tools
 
-                    async with session.post(url, json=payload) as response:
-                        response.raise_for_status()
-                        data = await response.json()
+                async with session.post(url, json=payload) as response:
+                    response.raise_for_status()
+                    data = await response.json()
 
-                    msg = data.get("message") or {}
-                    tool_calls = msg.get("tool_calls") or []
-                    if tools and tool_calls and round_idx < self._MAX_TOOL_ROUNDS:
-                        assistant_message: dict[str, Any] = {"role": "assistant"}
-                        if msg.get("content"):
-                            assistant_message["content"] = msg["content"]
-                        assistant_message["tool_calls"] = tool_calls
-                        payload_messages.append(assistant_message)
+                msg = data.get("message") or {}
+                tool_calls = msg.get("tool_calls") or []
+                if tools and tool_calls and round_idx < self._MAX_TOOL_ROUNDS:
+                    assistant_message: dict[str, Any] = {"role": "assistant"}
+                    if msg.get("content"):
+                        assistant_message["content"] = msg["content"]
+                    assistant_message["tool_calls"] = tool_calls
+                    payload_messages.append(assistant_message)
 
-                        for tool_call in tool_calls[: self._MAX_TOOL_CALLS_PER_ROUND]:
-                            tool_name, tool_result = await self._execute_tool_call(tool_call)
-                            for source in self._extract_sources_from_tool_result(
-                                tool_name, tool_result
-                            ):
-                                if source not in collected_sources:
-                                    collected_sources.append(source)
-                            payload_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_name": tool_name,
-                                    "content": tool_result,
-                                }
-                            )
-                        continue
+                    for tool_call in tool_calls[: self._MAX_TOOL_CALLS_PER_ROUND]:
+                        tool_name, tool_result = await self._execute_tool_call(tool_call)
+                        for source in self._extract_sources_from_tool_result(
+                            tool_name, tool_result
+                        ):
+                            if source not in collected_sources:
+                                collected_sources.append(source)
+                        payload_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_name": tool_name,
+                                "content": tool_result,
+                            }
+                        )
+                    continue
 
-                    content = msg.get("content") or ""
-                    if not content and msg.get("thinking"):
-                        content = self._extract_answer_from_thinking(msg["thinking"])
-                    if not content:
-                        logger.error(f"Unexpected Ollama response: {data}")
-                        return "not worth my time"
-                    content = self._strip_think_block(content)
-                    content = self._append_sources_to_response(content, collected_sources)
-                    logger.info(f"Ollama response: {content}")
-                    return content
+                content = msg.get("content") or ""
+                if not content and msg.get("thinking"):
+                    content = self._extract_answer_from_thinking(msg["thinking"])
+                if not content:
+                    logger.error(f"Unexpected Ollama response: {data}")
+                    return "not worth my time"
+                content = self._strip_think_block(content)
+                content = self._append_sources_to_response(content, collected_sources)
+                logger.info(f"Ollama response: {content}")
+                return content
 
             return "not worth my time"
 
@@ -2789,6 +3144,16 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
             timeout=float(settings.genai.request_timeout),
         )
         self.client = self._openai_local
+
+    def _openai_chat_extra_body(self, *, use_tools: bool) -> dict[str, Any]:
+        return {
+            "repeat_penalty": float(self.settings.genai.repeat_penalty),
+            "parse_tool_calls": True,
+            "parallel_tool_calls": True,
+        }
+
+    def _use_inline_tool_call_fallback(self) -> bool:
+        return True
 
     def _build_openai_messages(
         self,
@@ -2833,12 +3198,6 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
 
             collected_sources: list[dict[str, str]] = []
             temperature = float(self.settings.genai.temperature)
-            repeat_penalty = float(self.settings.genai.repeat_penalty)
-            extra_body: dict[str, Any] = {
-                "repeat_penalty": repeat_penalty,
-                "parse_tool_calls": True,
-                "parallel_tool_calls": True,
-            }
 
             max_tokens = max(self.settings.genai.tokens.output_max, 256)
 
@@ -2848,8 +3207,10 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
                     "messages": msgs,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
-                    "extra_body": extra_body,
                 }
+                extra_body = self._openai_chat_extra_body(use_tools=use_tools)
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
                 if use_tools and tools:
                     kwargs["tools"] = tools
                 return self._openai_local.chat.completions.create(**kwargs)
@@ -2873,6 +3234,7 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
                         )
                     else:
                         raise
+                self._log_completion_usage("llamacpp_chat", round_idx, response)
                 msg = response.choices[0].message
                 tool_calls = getattr(msg, "tool_calls", None) or []
                 parsed_calls: list[dict[str, Any]] = []
@@ -2890,12 +3252,17 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
                     )
 
                 inline_call_mode = False
-                if tools and not parsed_calls and isinstance(msg.content, str):
+                if (
+                    tools
+                    and not parsed_calls
+                    and isinstance(msg.content, str)
+                    and self._use_inline_tool_call_fallback()
+                ):
                     parsed_calls = self._parse_inline_tool_calls(msg.content)
                     inline_call_mode = bool(parsed_calls)
                     if inline_call_mode:
                         logger.warning(
-                            "llama.cpp returned inline <tool_call> content; using parser fallback."
+                            "Model returned inline tool markup; using parser fallback."
                         )
 
                 if tools and parsed_calls and round_idx < self._MAX_TOOL_ROUNDS:
@@ -2961,8 +3328,21 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
                         "Tool rounds exhausted with empty content; forcing "
                         "no-tool final compose pass."
                     )
+                    openai_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Tool budget is exhausted. Use the tool results already in "
+                                "this thread and write the final Discord reply in plain text "
+                                "only. Do not output DSML, XML, or tool_call markup."
+                            ),
+                        }
+                    )
                     final_response = await asyncio.to_thread(
                         _chat_create, openai_messages, False
+                    )
+                    self._log_completion_usage(
+                        "llamacpp_chat_final", round_idx, final_response
                     )
                     final_msg = final_response.choices[0].message
                     content = (final_msg.content or "").strip() if final_msg.content else ""
@@ -2970,6 +3350,19 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
                     logger.error(f"Unexpected llama.cpp chat response: {response!r}")
                     return "not worth my time"
                 content = self._strip_think_block(content)
+                content = self._strip_tool_call_blocks(content)
+                if self._looks_like_leaked_tool_markup(content) or not content.strip():
+                    if collected_sources:
+                        content = (
+                            "couldn't stitch a clean summary from the lookups, "
+                            "but here's what i found"
+                        )
+                    else:
+                        logger.error(
+                            "Model returned tool markup instead of a reply: "
+                            f"{content[:200]!r}"
+                        )
+                        return "not worth my time"
                 content = self._append_sources_to_response(content, collected_sources)
                 logger.info(f"llama.cpp response: {content}")
                 return content
@@ -2988,19 +3381,21 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
         def worker() -> None:
             try:
                 max_tokens = max(self.settings.genai.tokens.output_max, 256)
-                stream = self._openai_local.chat.completions.create(
-                    model=self.settings.genai.model,
-                    messages=openai_messages,
-                    temperature=float(self.settings.genai.temperature),
-                    max_tokens=max_tokens,
-                    stream=True,
-                    extra_body={
-                        "repeat_penalty": float(self.settings.genai.repeat_penalty),
-                        "parse_tool_calls": False,
-                        "parallel_tool_calls": False,
-                    },
-                )
+                stream_kwargs: dict[str, Any] = {
+                    "model": self.settings.genai.model,
+                    "messages": openai_messages,
+                    "temperature": float(self.settings.genai.temperature),
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                stream_extra = self._openai_chat_extra_body(use_tools=False)
+                if stream_extra:
+                    stream_kwargs["extra_body"] = stream_extra
+                stream = self._openai_local.chat.completions.create(**stream_kwargs)
                 for chunk in stream:
+                    if getattr(chunk, "usage", None):
+                        self._log_completion_usage("llamacpp_stream", 0, chunk)
                     if not getattr(chunk, "choices", None):
                         continue
                     ch0 = chunk.choices[0]
@@ -3043,8 +3438,11 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
         merge_reply_chain: bool = True,
     ) -> AsyncIterator[str]:
         has_reference = bool(message.reference and message.reference.message_id)
-        reply_mode = self._classify_mention_reply_mode(
-            question, has_reference=has_reference, retry_hint=retry_hint
+        reply_mode, _ctx_limit_s, history_minutes = self._select_context_plan(
+            question,
+            has_reference=has_reference,
+            retry_hint=retry_hint,
+            recent_context_human_turns=recent_context_human_turns,
         )
         has_image_attachments = self._VISION_ENABLED and self._message_has_images(message)
         if not has_image_attachments and has_reference and self._VISION_ENABLED:
@@ -3061,22 +3459,24 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
             )
             if len(chain) > 3:
                 chain = chain[-3:]
-            messages_for_context = chain
-            if has_reference:
-                messages_for_context = list(messages_for_context)
-                if message.id not in {m.id for m in messages_for_context}:
-                    messages_for_context.append(message)
-        else:
-            _ctx_limit_s = (
-                recent_context_human_turns
-                if recent_context_human_turns is not None
-                else self._mention_context_limit(
-                    question,
-                    settings.genai.question.recent_messages,
-                    has_reference=has_reference,
-                    retry_hint=retry_hint,
-                )
+            recent_messages = await self._collect_recent_context_messages(
+                message,
+                _ctx_limit_s,
+                user_ids=user_ids,
+                include_current=has_reference,
+                history_before=history_before,
+                merge_reply_chain=merge_reply_chain,
+                history_minutes=history_minutes,
             )
+            messages_by_id: dict[int, Message] = {m.id: m for m in recent_messages}
+            for chain_message in chain:
+                messages_by_id[chain_message.id] = chain_message
+            if has_reference:
+                messages_by_id[message.id] = message
+            messages_for_context = sorted(
+                messages_by_id.values(), key=lambda m: (m.created_at, m.id)
+            )
+        else:
             messages_for_context = await self._collect_recent_context_messages(
                 message,
                 _ctx_limit_s,
@@ -3084,6 +3484,7 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
                 include_current=has_reference,
                 history_before=history_before,
                 merge_reply_chain=merge_reply_chain,
+                history_minutes=history_minutes,
             )
         user_payload, inline_images, resolved_reply_mode = await self._build_mention_reply_payload(
             message,
@@ -3142,7 +3543,45 @@ class GenAILlamaCpp(_GenAILocalWithWebTools):
             yield d
 
 
-if settings.genai.model.startswith("llamacpp/"):
+class GenAIOpenCodeGo(GenAILlamaCpp):
+    """OpenCode Go subscription (OpenAI-compatible chat completions)."""
+
+    _VISION_ENABLED = False
+    _DEFAULT_BASE_URL = "https://opencode.ai/zen/go"
+
+    def __init__(self, settings: Settings) -> None:
+        _GenAILocalWithWebTools.__init__(self, settings)
+        api_key = settings.tokens.opencode_go.strip()
+        if not api_key:
+            raise ValueError(
+                "tokens.opencode_go is required when genai.model uses opencode-go/"
+            )
+        base = settings.genai.base_url.strip()
+        if not base or base == "http://127.0.0.1:11434":
+            base = self._DEFAULT_BASE_URL
+        base_u = normalize_llamacpp_openai_base_url(base)
+        self._openai_local = OpenAI(
+            base_url=base_u,
+            api_key=api_key,
+            timeout=float(settings.genai.request_timeout),
+        )
+        self.client = self._openai_local
+
+    def _openai_chat_extra_body(self, *, use_tools: bool) -> dict[str, Any]:
+        # DeepSeek V4 Flash defaults to thinking mode; without this, completion
+        # tokens are often spent on reasoning_content and visible replies truncate.
+        return {"thinking": {"type": "disabled"}}
+
+    def _use_inline_tool_call_fallback(self) -> bool:
+        # DeepSeek V4 on OpenCode Go often emits DSML tool markup in content
+        # instead of structured tool_calls; parse and run those server-side.
+        return True
+
+
+if settings.genai.model.startswith("opencode-go/"):
+    settings.genai.model = settings.genai.model.split("/", 1)[1]  # type: ignore
+    client = GenAIOpenCodeGo(settings)
+elif settings.genai.model.startswith("llamacpp/"):
     settings.genai.model = settings.genai.model.split("/", 1)[1]  # type: ignore
     client = GenAILlamaCpp(settings)
 elif settings.genai.model.startswith("ollama/"):

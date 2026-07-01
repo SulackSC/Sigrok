@@ -3,6 +3,7 @@ from discord.ext import commands
 from loguru import logger
 from sqlalchemy import select
 
+from sigrok import db
 from sigrok.db import User, db_logger, get_session
 
 
@@ -14,9 +15,15 @@ class Presence(commands.Cog):
     @db_logger
     async def on_member_join(self, member: Member):
         logger.info(f"Member joined: {member.name} ({member.id})")
+        if member.guild is None:
+            return
+        await db.read_or_add_user(member.guild.id, member.id)
         async with get_session() as session:
             result = await session.execute(
-                select(User).where(User.member_id == member.id)
+                select(User).where(
+                    User.guild_id == member.guild.id,
+                    User.user_id == member.id,
+                )
             )
             user = result.scalar_one_or_none()
             if user:
@@ -27,9 +34,14 @@ class Presence(commands.Cog):
     @db_logger
     async def on_member_remove(self, member: Member):
         logger.info(f"Member left: {member.name} ({member.id})")
+        if member.guild is None:
+            return
         async with get_session() as session:
             result = await session.execute(
-                select(User).where(User.member_id == member.id)
+                select(User).where(
+                    User.guild_id == member.guild.id,
+                    User.user_id == member.id,
+                )
             )
             user = result.scalar_one_or_none()
             if user:

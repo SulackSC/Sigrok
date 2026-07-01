@@ -9,12 +9,13 @@ max_overflow = 20
 pool_recycle = 3600
 pool_timeout = 30
 backup_dir = "backups"
+# Number of most recent backup files to keep (not days).
 retention = 5
 
 [bot]
 prefix = "."
 temp_dir = "."
-cogs = ["misc", "presence", "backup", "voice_rec", "bluesky", "conditional_posts"]
+cogs = ["misc", "presence", "backup", "voice_rec", "bluesky", "x", "conditional_posts", "streaming_chat"]
 
 [bot.owner]
 id = 111111111111111111
@@ -67,14 +68,16 @@ roles = []
 # Active backend (llama.cpp `llama-server` on localhost:8081; alias must match the server's -a flag).
 # Runtime note: recent testing preferred llama.cpp KV cache quantization at Q4_1.
 # Example server flags vary by build; keep tool-capable template support enabled when using web tools.
-model = "llamacpp/qwen3.6-35b-a3b"
+model = "llamacpp/qwen3.5-9b"
 base_url = "http://127.0.0.1:8081"
-temperature = 1.05
+# OpenCode Go (DeepSeek V4 Flash, etc.): opencode_go key in .secrets.toml
+# model = "opencode-go/deepseek-v4-flash"
+# base_url = "https://opencode.ai/zen/go"
+temperature = 0.7
 repeat_penalty = 1.15
 request_timeout = 180
-# Rollback to prior native llama.cpp model:
-# model = "llamacpp/qwen3.5-27b"
-# base_url = "http://127.0.0.1:8081"
+# Requires single ~8 GiB GPU; see docs/model-runtime-notes.md and deploy/systemd/llama-server.qwen35-9b.service
+# Rollback (dual GPU): model = "llamacpp/qwen3.6-35b-a3b" or "llamacpp/qwen3.6-27b"
 # Personality for Discord replies: resources/sigrok_personality_prompt.txt
 
 [genai.tokens]
@@ -112,3 +115,41 @@ thread_parent_height = 8
 enabled = false
 bearer_token = ""
 max_chars = 280
+poll_seconds = 30
+state_file = ".x_state.json"
+user_id = ""
+username = ""
+thread_parent_height = 8
+
+# Live streaming chat (Twitch, YouTube, Kick). Requires tokens in .secrets.toml — see README.
+[streaming]
+enabled = false
+global_reply_cooldown_seconds = 8
+per_user_cooldown_seconds = 60
+recent_messages_buffer = 40
+state_file = ".streaming_state.json"
+
+[streaming.twitch]
+enabled = false
+bot_username = "sigrok"
+bot_user_id = ""
+owner_user_id = ""
+channels = ["yourchannel"]
+max_chars = 500
+
+[streaming.youtube]
+enabled = false
+bot_display_name = "Sigrok"
+channels = ["UCxxxxxxxx"]
+max_chars = 200
+poll_fallback = true
+
+[streaming.kick]
+enabled = false
+bot_username = "sigrok"
+channels = ["yourchannel"]
+receive_mode = "websocket"
+webhook_host = "0.0.0.0"
+webhook_port = 8765
+webhook_path = "/kick/eventsub"
+max_chars = 500

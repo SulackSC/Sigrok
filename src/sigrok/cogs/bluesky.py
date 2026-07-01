@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -28,6 +29,15 @@ class BlueskyCog(commands.Cog):
     def cog_unload(self) -> None:
         if self.poll_mentions.is_running():
             self.poll_mentions.cancel()
+        if self.client._http is not None and not self.client._http.closed:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.client.close())
+                else:
+                    loop.run_until_complete(self.client.close())
+            except Exception as exc:
+                logger.warning(f"Failed to close Bluesky HTTP session: {exc}")
 
     def _load_state(self) -> None:
         if not self._state_path.exists():

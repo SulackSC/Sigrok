@@ -7,11 +7,31 @@ from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import BaseSettings
 
 
+class YouTubeTokenSettings(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    refresh_token: str = ""
+
+
+class KickTokenSettings(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+
+
 class Tokens(BaseModel):
     bot: str
     gpt: str = ""
     hf: str = ""
     anthropic: str = ""
+    opencode_go: str = ""
+    twitch_client_id: str = ""
+    twitch_client_secret: str = ""
+    twitch_bot_access_token: str = ""
+    twitch_bot_refresh_token: str = ""
+    youtube: YouTubeTokenSettings = Field(default_factory=YouTubeTokenSettings)
+    kick: KickTokenSettings = Field(default_factory=KickTokenSettings)
 
 
 class BlueskySettings(BaseModel):
@@ -29,15 +49,61 @@ class BlueskySettings(BaseModel):
 
 class XSettings(BaseModel):
     enabled: bool = False
-    # OAuth2 "access token" (bearer) scoped for posting.
+    # OAuth2 user-context access token (tweet.read, tweet.write, users.read).
     bearer_token: str = ""
     api_base_url: str = "https://api.x.com"
     max_chars: int = 280
+    poll_seconds: int = 30
+    state_file: str = ".x_state.json"
+    # Optional; resolved via GET /2/users/me on first use when empty.
+    user_id: str = ""
+    username: str = ""
+    thread_parent_height: int = 8
 
 
 class SocialSettings(BaseModel):
     bluesky: BlueskySettings = Field(default_factory=BlueskySettings)
     x: XSettings = Field(default_factory=XSettings)
+
+
+class TwitchStreamingSettings(BaseModel):
+    enabled: bool = False
+    bot_username: str = "sigrok"
+    bot_user_id: str = ""
+    owner_user_id: str = ""
+    channels: list[str] = Field(default_factory=list)
+    max_chars: int = 500
+
+
+class YouTubeStreamingSettings(BaseModel):
+    enabled: bool = False
+    bot_display_name: str = "Sigrok"
+    channels: list[str] = Field(default_factory=list)
+    max_chars: int = 200
+    poll_fallback: bool = True
+
+
+class KickStreamingSettings(BaseModel):
+    enabled: bool = False
+    bot_username: str = "sigrok"
+    channels: list[str] = Field(default_factory=list)
+    receive_mode: Literal["websocket", "webhook"] = "websocket"
+    webhook_host: str = "127.0.0.1"
+    webhook_public_key: str = ""
+    webhook_port: int = 8765
+    webhook_path: str = "/kick/eventsub"
+    max_chars: int = 500
+
+
+class StreamingSettings(BaseModel):
+    enabled: bool = False
+    global_reply_cooldown_seconds: float = 8.0
+    per_user_cooldown_seconds: float = 60.0
+    recent_messages_buffer: int = 40
+    state_file: str = ".streaming_state.json"
+    twitch: TwitchStreamingSettings = Field(default_factory=TwitchStreamingSettings)
+    youtube: YouTubeStreamingSettings = Field(default_factory=YouTubeStreamingSettings)
+    kick: KickStreamingSettings = Field(default_factory=KickStreamingSettings)
 
 
 class DatabaseSettings(BaseModel):
@@ -168,6 +234,7 @@ class Settings(BaseSettings):
     genai: GenaiSettings
     tokens: Tokens
     social: SocialSettings = Field(default_factory=SocialSettings)
+    streaming: StreamingSettings = Field(default_factory=StreamingSettings)
 
 
 def load_toml(path: Path) -> dict[str, Any]:

@@ -1,13 +1,14 @@
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pprint import pformat
 from typing import AsyncIterator, Optional
 
 from loguru import logger
-from sqlalchemy import String, Text
+from sqlalchemy import String, Text, UniqueConstraint, and_, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.future import select
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
@@ -30,6 +31,7 @@ async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("guild_id", "user_id", name="uq_user_guild_user"),)
     __allow_unmapped__ = True
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -42,7 +44,13 @@ class User(Base):
         return pformat(self.to_dict())
 
     def to_dict(self) -> dict:
-        return self.__dict__
+        return {
+            "id": self.id,
+            "guild_id": self.guild_id,
+            "user_id": self.user_id,
+            "rating": self.rating,
+            "is_present": self.is_present,
+        }
 
 
 class ScheduleMentionJob(Base):
@@ -68,6 +76,7 @@ class ScheduleMentionJob(Base):
 
 
 _schedule_tables_created = False
+_users_schema_ensured = False
 
 
 def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -76,6 +85,32 @@ def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt.tzinfo is None:
         return dt
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+async def ensure_user_schema() -> None:
+    """Dedupe users and add unique index on existing SQLite databases."""
+    global _users_schema_ensured
+    if _users_schema_ensured:
+        return
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                """
+                DELETE FROM users
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM users GROUP BY guild_id, user_id
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_guild_user "
+                "ON users (guild_id, user_id)"
+            )
+        )
+    _users_schema_ensured = True
 
 
 async def ensure_schedule_tables() -> None:
@@ -140,6 +175,30 @@ async def list_schedule_mention_jobs() -> list[ScheduleMentionJob]:
         return list(result.scalars().all())
 
 
+async def read_due_schedule_jobs(now: datetime) -> list[ScheduleMentionJob]:
+    """Return one-shot and cron jobs that are due at or before `now`."""
+    await ensure_schedule_tables()
+    now_naive = _to_naive_utc(now)
+    async with get_session() as session:
+        result = await session.execute(
+            select(ScheduleMentionJob).where(
+                or_(
+                    and_(
+                        ScheduleMentionJob.kind == "once",
+                        ScheduleMentionJob.due_at.is_not(None),
+                        ScheduleMentionJob.due_at <= now_naive,
+                    ),
+                    and_(
+                        ScheduleMentionJob.kind == "cron",
+                        ScheduleMentionJob.next_fire.is_not(None),
+                        ScheduleMentionJob.next_fire <= now_naive,
+                    ),
+                )
+            )
+        )
+        return list(result.scalars().all())
+
+
 async def update_schedule_cron_next_fire(job_id: str, next_fire: datetime) -> None:
     await ensure_schedule_tables()
     async with get_session() as session:
@@ -152,6 +211,23 @@ async def update_schedule_cron_next_fire(job_id: str, next_fire: datetime) -> No
             await session.commit()
 
 
+async def bump_once_schedule_job_due(job_id: str, delay: timedelta) -> None:
+    """Push a one-shot job forward after a failed delivery attempt (avoids tight retry loops)."""
+    await ensure_schedule_tables()
+    new_due = datetime.now(timezone.utc) + delay
+    async with get_session() as session:
+        result = await session.execute(
+            select(ScheduleMentionJob).where(
+                ScheduleMentionJob.job_id == job_id,
+                ScheduleMentionJob.kind == "once",
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is not None:
+            row.due_at = _to_naive_utc(new_due)
+            await session.commit()
+
+
 def db_logger(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -161,9 +237,9 @@ def db_logger(func):
             elapsed_time = time.time() - start_time
             logger.info(f"{func.__name__} executed in {elapsed_time:.2f} seconds")
             return result
-        except Exception as e:
-            logger.error(f"Error in {func.__name__}: {e}")
-            return None
+        except Exception:
+            logger.exception(f"Error in {func.__name__}")
+            raise
 
     return wrapper
 
@@ -193,18 +269,29 @@ async def read_user(guild_id: int, user_id: int) -> Optional[User]:
 
 @db_logger
 async def read_or_add_user(guild_id: int, user_id: int) -> User:
+    await ensure_user_schema()
     user = await read_user(guild_id, user_id)
-    if user is None:
-        user = User(guild_id=guild_id, user_id=user_id, rating=100)
+    if user is not None:
+        logger.info(f"Existing user found: {user}")
+        return user
+    user = User(guild_id=guild_id, user_id=user_id, rating=100)
+    try:
         await add_user(user)
         logger.info(f"New user created: {user}")
-    else:
-        logger.info(f"Existing user found: {user}")
-    return user
+        return user
+    except IntegrityError:
+        existing = await read_user(guild_id, user_id)
+        if existing is None:
+            raise
+        logger.info(f"Existing user found after conflict: {existing}")
+        return existing
 
 
 @db_logger
 async def read_or_add_users(guild_id: int, user_ids: list[int]) -> list[User]:
+    await ensure_user_schema()
+    if not user_ids:
+        return []
     async with get_session() as session:
         stmt = select(User).where(User.guild_id == guild_id, User.user_id.in_(user_ids))
         result = await session.execute(stmt)
@@ -216,9 +303,27 @@ async def read_or_add_users(guild_id: int, user_ids: list[int]) -> list[User]:
             for user_id in missing_user_ids
         ]
 
-        session.add_all(new_users)
-        await session.commit()
-        return list(existing_users.values()) + new_users
+        if new_users:
+            session.add_all(new_users)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                result = await session.execute(stmt)
+                existing_users = {user.user_id: user for user in result.scalars().all()}
+                return [existing_users[uid] for uid in user_ids if uid in existing_users]
+        return [existing_users[uid] for uid in user_ids if uid in existing_users] + new_users
+
+
+@db_logger
+async def read_users_by_ids(guild_id: int, user_ids: list[int]) -> list[User]:
+    if not user_ids:
+        return []
+    await ensure_user_schema()
+    async with get_session() as session:
+        stmt = select(User).where(User.guild_id == guild_id, User.user_id.in_(user_ids))
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
 
 
 @db_logger
