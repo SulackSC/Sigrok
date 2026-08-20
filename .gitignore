@@ -13,6 +13,10 @@ logs/*
 .env
 .bluesky_state.json
 .x_state.json
+.streaming_state.json
+# Runtime dumps; loguru tracebacks can print token objects
+sigrok-manual.out
+*.out
 # Local dumps / backups (may contain tokens or PII)
 sigrok_logs.txt
 settings.toml.backup*

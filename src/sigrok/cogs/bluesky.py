@@ -10,6 +10,7 @@ from sigrok import genai
 from sigrok.config import settings
 from sigrok.genai import SIGROK_PERSONALITY_SYSTEM_PROMPT
 from sigrok.social_client import BlueskyClient, BlueskyNotification
+from sigrok.streaming.response import apply_nsfw_filter
 
 
 class BlueskyCog(commands.Cog):
@@ -152,7 +153,7 @@ class BlueskyCog(commands.Cog):
                 current_message=current_post.to_genai_message(),
                 max_chars=settings.social.bluesky.max_chars,
             )
-            response = self._normalize_bot_response(response)
+            response = apply_nsfw_filter(self._normalize_bot_response(response))
             if self._should_skip_response(question, response):
                 logger.info(
                     "Skipping Bluesky reply for {} due to empty/invalid model output.",

@@ -10,6 +10,7 @@ from sigrok import genai
 from sigrok.config import settings
 from sigrok.genai import SIGROK_PERSONALITY_SYSTEM_PROMPT
 from sigrok.social_client import XClient, XTweet
+from sigrok.streaming.response import apply_nsfw_filter
 
 
 class XCog(commands.Cog):
@@ -147,7 +148,7 @@ class XCog(commands.Cog):
                 current_message=current_tweet.to_genai_message(),
                 max_chars=settings.social.x.max_chars,
             )
-            response = self._normalize_bot_response(response)
+            response = apply_nsfw_filter(self._normalize_bot_response(response))
             if self._should_skip_response(question, response):
                 logger.info(
                     "Skipping X reply for {} due to empty/invalid model output.",

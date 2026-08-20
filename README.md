@@ -8,13 +8,15 @@ The bot creates `data.db` on first run via `Base.metadata.create_all`. There are
 
 ## Features
 
-- **Whitelist** — Only configured guilds/channels are used; the bot leaves servers that are not allowed.
-- **Generative replies** — `@Sigrok` in **any channel** of a **whitelisted guild**; backends include Ollama, llama.cpp (`llama-server`), OpenAI, and Anthropic (see configuration).
+- **Whitelist** — Official home guilds/channels live in `settings.toml`. Each SuperSigrok sub can host Sigrok in **one** server (`.supersigrok join` / `.supersigrok leave` from DMs); that stays only while the sponsor is entitled (plus a short grace period).
+- **Generative replies** — `@Sigrok` in **any channel** of an **authorized guild**; backends include Ollama, llama.cpp (`llama-server`), OpenAI, and Anthropic (see configuration).
+- **Free-user rate limit** — Non-SuperSigrok users get a global per-hour @mention quota; when exhausted, Sigrok replies in-character that it cannot put more effort in for a while (no ❌ error popup).
 - **Social** — Optional Bluesky and X (Twitter) mention bots; replies when `@mentioned` with the same Sigrok personality as Discord.
 - **Streaming chat** — Optional Twitch, YouTube Live Chat, and Kick integration (`streaming_chat` cog); replies on `@mention` only.
 - **Voice** — Chunked recording from voice channels (see `voice_rec` cog).
 - **Automation** — Cron-like and one-shot jobs, join/leave messages, timed posts (`conditional_posts` cog).
 - **Data** — SQLite via SQLAlchemy, optional rolling backups (`backup` cog).
+- **Relationship stance** — Guild-local numeric/enum RPG state influences tone silently; an OpenCode Max Thinking pass may update any user in the prior day of channel context at most once per guild every 24 hours.
 
 ## Requirements
 
@@ -41,6 +43,8 @@ The bot creates `data.db` on first run via `Base.metadata.create_all`. There are
    hf = "<huggingface token, optional>"
    anthropic = "<anthropic key, optional>"
    opencode_go = "<opencode go api key, optional>"
+   stripe_secret_key = "<stripe secret key, optional>"
+   stripe_webhook_secret = "<stripe webhook signing secret, optional>"
    ```
 
 4. From the repo root, run the bot:
@@ -60,8 +64,31 @@ The bot creates `data.db` on first run via `Base.metadata.create_all`. There are
 | `settings.toml` | Bot prefix, cogs, whitelist, `[genai]` model and tuning, social toggles (local only; gitignored). |
 | `.secrets.toml` | API tokens merged over `settings.toml`. |
 | `resources/sigrok_personality_prompt.txt` | Main Discord personality / system text for the model (see code). |
+| `resources/nsfw_blocklist.txt` | NSFW terms for outbound reply filtering; matches replace the whole response with 🍆. |
+
+Pinned Discord messages that start and end with `@Sigrok` become per-channel rules in the system prompt (see `BOT_PERMISSIONS.md`).
 
 A `sigrok.service` systemd unit example lives under `deploy/systemd/`.
+
+Relationship state contains only affinity, trust, disposition, roast level, engagement weight,
+last vibe, and timestamps—no free-text user facts. Private DM controls (anyone can use them):
+`.relationship show [@user]`, `.relationship set @user <field> <value>`, and
+`.relationship reset [@user]`. On mention, at most once per channel per 24h, a background SuperSigrok
+Max Thinking pass may update numeric/enum stance from that channel's context (never posted to Discord).
+Sheets stay guild-scoped; only the pass cooldown is per channel.
+
+### SuperSigrok (paid)
+
+Subscribe with `.supersigrok` / `.supersigrok buy` (Stripe Checkout). Entitled users get Max Thinking replies, DMs, NSFW filter bypass, and **one** add-to-server slot managed from DMs:
+
+- `.supersigrok join` (alias: `invite`) — DM the OAuth invite link
+- `.supersigrok leave` — leave that server and free the slot
+- `.supersigrok server` — show the current sponsored server
+- `.supersigrok claim` — in-server fallback if audit logs miss the adder (Manage Server required)
+
+Official home servers stay in `[[bot.whitelist]]`. Subscriber servers are stored in SQLite; if SuperSigrok lapses, the bot stays for `bot.supersigrok.guild_grace_days` (default 3) then leaves. Enable **Public Bot** in the Discord Developer Portal so invite links work; see [`BOT_PERMISSIONS.md`](BOT_PERMISSIONS.md).
+
+Free users share a global @mention quota (`free_replies_per_window` / `free_window_minutes`). SuperSigrok users skip it.
 
 ## Language models (`[genai]`)
 

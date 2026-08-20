@@ -15,7 +15,7 @@ retention = 5
 [bot]
 prefix = "."
 temp_dir = "."
-cogs = ["misc", "presence", "backup", "voice_rec", "bluesky", "x", "conditional_posts", "streaming_chat"]
+cogs = ["misc", "owner", "presence", "backup", "voice_rec", "bluesky", "x", "conditional_posts", "streaming_chat", "supersigrok_billing"]
 
 [bot.owner]
 id = 111111111111111111
@@ -61,8 +61,35 @@ roles = []
 # interval_minutes = 60
 # message = "Hourly reminder."
 
-# Discord user IDs allowed to create / cancel `@Sigrok @schedule ...` jobs.
-# schedule_controller_user_ids = [272913479231471616]
+# schedule_controller_user_ids = [111111111111111111]
+
+# SuperSigrok (paid tier): same deepseek-v4-flash model with Max Thinking enabled.
+# Grant via Discord user IDs and/or role IDs; Stripe Checkout + webhook persist grants.
+# Subscribers can add the bot to their own servers (.supersigrok invite).
+[bot.supersigrok]
+user_ids = []
+role_ids = []
+output_max = 8192
+relationship_reflection_output_max = 32768
+# Discord OAuth invite permissions (View Channel/Send/History/Embed/Attach/Connect/Speak/Audit Log/Reactions)
+invite_permissions = 3263680
+# Days to keep a subscriber guild after SuperSigrok lapses, then leave.
+guild_grace_days = 3
+# Global free-user @mention quota (SuperSigrok users skip).
+free_replies_per_window = 8
+free_window_minutes = 60
+cheap_output_max = 80
+# Stripe: leave stripe_price_id empty to charge the default $5 USD/month.
+# Or set stripe_price_id = "price_..." to use a Dashboard Price instead.
+stripe_price_id = ""
+stripe_amount_cents = 500
+stripe_currency = "usd"
+stripe_product_name = "SuperSigrok"
+stripe_success_url = "https://discord.com/channels/@me"
+stripe_cancel_url = "https://discord.com/channels/@me"
+stripe_webhook_host = "0.0.0.0"
+stripe_webhook_port = 8788
+stripe_webhook_path = "/stripe/webhook"
 
 [genai]
 # Active backend (llama.cpp `llama-server` on localhost:8081; alias must match the server's -a flag).

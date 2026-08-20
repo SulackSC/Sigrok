@@ -14,6 +14,7 @@ from sigrok.streaming.mentions import message_mentions_bot, strip_bot_mention
 from sigrok.streaming.messages import StreamingChatMessage
 from sigrok.streaming.ratelimit import StreamingRateLimiter
 from sigrok.streaming.response import (
+    apply_nsfw_filter,
     normalize_bot_response,
     should_skip_response,
     truncate_for_platform,
@@ -123,7 +124,9 @@ class StreamingChatCog(commands.Cog):
                     current_message=message.to_genai_message(),
                     max_chars=max_chars,
                 )
-                response = normalize_bot_response(response, bot_handle=bot_handle)
+                response = apply_nsfw_filter(
+                    normalize_bot_response(response, bot_handle=bot_handle)
+                )
                 if should_skip_response(question, response):
                     logger.info(
                         "Skipping {} reply for {} due to empty/invalid model output.",

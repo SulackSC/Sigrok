@@ -1,0 +1,225 @@
+# NSFW output blocklist for Sigrok replies.
+# One term per line. Lines starting with # are comments. Blank lines are ignored.
+# Single words use word-boundary matching; multi-word phrases use substring matching.
+
+# explicit sexual terms
+porn
+pornography
+hentai
+xxx
+nsfw
+nude
+nudes
+naked
+nudity
+erotic
+erotica
+orgasm
+masturbat
+masturbation
+blowjob
+handjob
+rimjob
+cumshot
+bukkake
+gangbang
+threesome
+foursome
+orgy
+fetish
+bdsm
+bondage
+dominatrix
+stripper
+strip club
+onlyfans
+camgirl
+camboy
+sex tape
+sex scene
+sexual intercourse
+oral sex
+anal sex
+
+# slurs and extreme terms (partial stems catch common variants)
+motherfuck
+cock
+dick
+penis
+vagina
+vulva
+clitoris
+testicle
+scrotum
+anus
+butthole
+boob
+boobs
+tits
+titty
+pussy
+dildo
+vibrator
+condom
+lube
+lubricant
+prostitut
+escort service
+sugar daddy
+sugar baby
+
+# phrases
+send nudes
+rule 34
+lewd pic
+lewd pics
+adult content
+adult video
+sex worker
+phone sex
+hook up for sex
+
+# adult sites and platforms
+pornhub
+pornhub.com
+xvideos
+xvideos.com
+xhamster
+xhamster.com
+redtube
+redtube.com
+youporn
+youporn.com
+xnxx
+xnxx.com
+spankbang
+spankbang.com
+eporner
+eporner.com
+tnaflix
+tube8
+beeg
+porntrex
+brazzers
+bangbros
+reality kings
+naughty america
+digitalplayground
+wicked pictures
+evil angel
+jules jordan
+blacked
+vixen
+teamskeet
+mofos
+babes
+chaturbate
+chaturbate.com
+myfreecams
+livejasmin
+stripchat
+bongacams
+cam4
+camsoda
+jerkmate
+fansly
+manyvids
+fancentro
+loyalfans
+justforfans
+nhentai
+nhentai.net
+hanime
+hanime.tv
+hentaihaven
+rule34.xxx
+rule34video
+e621
+e621.net
+gelbooru
+danbooru
+sankaku complex
+fakku
+literotica
+asstr
+motherless
+imagefap
+sex.com
+adultfriendfinder
+ashley madison
+seeking.com
+leolist
+eros.com
+skipthegames
+listcrawler
+
+# gooner / coomer slang
+goon
+gooner
+gooning
+goonette
+goon cave
+gooncave
+goon den
+goon hole
+goon pit
+goon fuel
+goon bait
+goon sesh
+goon session
+goon captions
+goon edits
+goon wall
+goonstation
+goon hypno
+coomer
+cooming
+coom
+coombrain
+coomers
+edging
+ruined orgasm
+ruin your orgasm
+babecock
+porn pmv
+pmv porn
+sissy hypno
+porn hypno
+hypno porn
+poppers
+sniff poppers
+jerk off
+jerking off
+jack off
+jacking off
+beat your meat
+touch yourself
+nofap relapse
+nutting
+bust a nut
+bust nut
+precum
+pre cum
+jizz
+splooge
+creampie
+breeding kink
+breed me
+breedable
+boner
+erection
+morning wood
+blue balls
+post nut clarity
+post nut
+gooning session
+pornbrain
+pornsick
+porn addict
+porn addiction
+relapse goon
+edge for hours
+leak her
+leaked nudes
+of leak
+onlyfans leak

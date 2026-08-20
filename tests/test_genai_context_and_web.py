@@ -187,6 +187,148 @@ def test_url_safety_helpers_block_internal_and_dedupe_sources() -> None:
     ]
 
 
+def test_duckduckgo_html_parser_removed() -> None:
+    tools = _new_tools()
+    assert not hasattr(tools, "_parse_duckduckgo_lite_results")
+    assert not hasattr(tools, "_extract_duckduckgo_result_url")
+    assert hasattr(tools, "_parse_searxng_results")
+    assert hasattr(tools, "_request_searxng_json")
+
+
+def test_parse_searxng_results_maps_and_caps() -> None:
+    tools = _new_tools()
+    payload = {
+        "results": [
+            {
+                "title": "Alpha",
+                "url": "https://example.com/a#frag",
+                "content": "first hit",
+            },
+            {
+                "title": "Alpha dup",
+                "url": "https://example.com/a",
+                "content": "duplicate url",
+            },
+            {
+                "title": "Beta",
+                "url": "https://example.com/b",
+                "content": "second",
+            },
+            {
+                "title": "Gamma",
+                "url": "https://example.com/c",
+                "content": "third",
+            },
+        ]
+    }
+    rows = tools._parse_searxng_results(payload, max_results=2)
+    assert len(rows) == 2
+    assert rows[0] == {
+        "title": "Alpha",
+        "url": "https://example.com/a",
+        "snippet": "first hit",
+    }
+    assert rows[1]["title"] == "Beta"
+    assert rows[1]["snippet"] == "second"
+
+
+def test_searxng_origin_guard_rejects_mismatch() -> None:
+    tools = _new_tools()
+    saved = settings.genai.web_search.base_url
+    settings.genai.web_search.base_url = "http://192.168.0.241:8080"
+    try:
+        tools._assert_searxng_origin(
+            "http://192.168.0.241:8080/search?q=test&format=json"
+        )
+        try:
+            tools._assert_searxng_origin(
+                "http://127.0.0.1:8080/search?q=test&format=json"
+            )
+            raise AssertionError("expected origin mismatch")
+        except ValueError as exc:
+            assert "origin mismatch" in str(exc)
+        try:
+            tools._assert_searxng_origin(
+                "http://192.168.0.241:9999/search?q=test&format=json"
+            )
+            raise AssertionError("expected origin mismatch")
+        except ValueError as exc:
+            assert "origin mismatch" in str(exc)
+    finally:
+        settings.genai.web_search.base_url = saved
+
+
+def test_search_web_searxng_happy_path(monkeypatch) -> None:
+    tools = _new_tools()
+    saved_url = settings.genai.web_search.base_url
+    saved_max = settings.genai.web_search.max_results
+    settings.genai.web_search.base_url = "http://192.168.0.241:8080"
+    settings.genai.web_search.max_results = 5
+
+    async def fake_request(url: str) -> dict:
+        assert url.startswith("http://192.168.0.241:8080/search?")
+        assert "format=json" in url
+        assert "q=openclaw" in url
+        return {
+            "results": [
+                {
+                    "title": "OpenClaw",
+                    "url": "https://example.com/openclaw",
+                    "content": "metasearch notes",
+                },
+                {
+                    "title": "Extra",
+                    "url": "https://example.com/extra",
+                    "content": "more",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(tools, "_request_searxng_json", fake_request)
+    try:
+        raw = asyncio.run(tools._search_web("openclaw", requested_results=1))
+        payload = __import__("json").loads(raw)
+        assert payload["query"] == "openclaw"
+        assert len(payload["results"]) == 1
+        assert payload["results"][0]["title"] == "OpenClaw"
+        assert payload["results"][0]["snippet"] == "metasearch notes"
+    finally:
+        settings.genai.web_search.base_url = saved_url
+        settings.genai.web_search.max_results = saved_max
+
+
+def test_search_web_searxng_empty_and_error(monkeypatch) -> None:
+    tools = _new_tools()
+    saved_url = settings.genai.web_search.base_url
+    settings.genai.web_search.base_url = "http://192.168.0.241:8080"
+
+    async def empty_request(_url: str) -> dict:
+        return {"results": []}
+
+    monkeypatch.setattr(tools, "_request_searxng_json", empty_request)
+    try:
+        raw = asyncio.run(tools._search_web("no hits please"))
+        payload = __import__("json").loads(raw)
+        assert payload["query"] == "no hits please"
+        assert payload["results"] == []
+        assert "note" in payload
+    finally:
+        settings.genai.web_search.base_url = saved_url
+
+    async def boom(_url: str) -> dict:
+        raise ValueError("searxng request origin mismatch: expected 'x', got 'y'")
+
+    monkeypatch.setattr(tools, "_request_searxng_json", boom)
+    name, raw = asyncio.run(
+        tools._execute_parsed_tool("search_web", {"query": "anything"})
+    )
+    assert name == "search_web"
+    payload = __import__("json").loads(raw)
+    assert payload["query"] == "anything"
+    assert "error" in payload
+    assert "origin mismatch" in payload["error"]
+
+
 def test_dsml_tool_markup_strip_and_parse() -> None:
     tools = _new_tools()
     dsml = (
@@ -337,7 +479,61 @@ def test_opencode_go_uses_hosted_openai_defaults() -> None:
         assert client._openai_chat_extra_body(use_tools=True) == {
             "thinking": {"type": "disabled"}
         }
+        assert client._openai_reasoning_effort() is None
         assert client._use_inline_tool_call_fallback() is True
         assert str(client._openai_local.base_url).rstrip("/").endswith("/v1")
+
+        token = genai._max_thinking.set(True)
+        try:
+            assert client._openai_chat_extra_body(use_tools=True) == {
+                "thinking": {"type": "enabled"}
+            }
+            assert client._openai_reasoning_effort() == "max"
+            assert client._openai_completion_max_tokens() >= settings.bot.supersigrok.output_max
+        finally:
+            genai._max_thinking.reset(token)
     finally:
         settings.tokens.opencode_go = saved
+
+
+def test_supersigrok_entitlement_user_and_role() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sigrok import supersigrok
+
+    saved_users = list(settings.bot.supersigrok.user_ids)
+    saved_roles = list(settings.bot.supersigrok.role_ids)
+    saved_everyone = settings.bot.supersigrok.everyone_until
+    supersigrok._runtime_user_ids.clear()
+    supersigrok._logged_everyone_until = None
+    try:
+        settings.bot.supersigrok.everyone_until = None
+        settings.bot.supersigrok.user_ids = [111]
+        settings.bot.supersigrok.role_ids = [222]
+        assert supersigrok.is_supersigrok(user_id=111) is True
+        assert supersigrok.is_supersigrok(user_id=999) is False
+        assert supersigrok.is_supersigrok(user_id=999, role_ids=[222]) is True
+        assert supersigrok.is_supersigrok(user_id=999, role_ids=[333]) is False
+
+        supersigrok.grant_user(444)
+        assert supersigrok.is_supersigrok(user_id=444) is True
+        supersigrok.revoke_user(444)
+        assert supersigrok.is_supersigrok(user_id=444) is False
+
+        settings.bot.supersigrok.everyone_until = datetime.now(timezone.utc) + timedelta(
+            hours=1
+        )
+        assert supersigrok.everyone_max_thinking_active() is True
+        assert supersigrok.is_supersigrok(user_id=999) is True
+
+        settings.bot.supersigrok.everyone_until = datetime.now(timezone.utc) - timedelta(
+            minutes=1
+        )
+        assert supersigrok.everyone_max_thinking_active() is False
+        assert supersigrok.is_supersigrok(user_id=999) is False
+    finally:
+        settings.bot.supersigrok.user_ids = saved_users
+        settings.bot.supersigrok.role_ids = saved_roles
+        settings.bot.supersigrok.everyone_until = saved_everyone
+        supersigrok._runtime_user_ids.clear()
+        supersigrok._logged_everyone_until = None

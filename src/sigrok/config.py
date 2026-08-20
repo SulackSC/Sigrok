@@ -1,6 +1,7 @@
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import tomli
 from pydantic import AliasChoices, BaseModel, Field
@@ -26,6 +27,8 @@ class Tokens(BaseModel):
     hf: str = ""
     anthropic: str = ""
     opencode_go: str = ""
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
     twitch_client_id: str = ""
     twitch_client_secret: str = ""
     twitch_bot_access_token: str = ""
@@ -167,6 +170,42 @@ class TimedPostRule(BaseModel):
     message: str
 
 
+class SupersigrokSettings(BaseModel):
+    """Paid SuperSigrok tier: DeepSeek V4 Flash Max Thinking instead of fast non-thinking.
+
+    Grant via Discord user/role IDs (manual) or Stripe subscriptions (webhook → DB).
+    """
+
+    user_ids: list[int] = Field(default_factory=list)
+    role_ids: list[int] = Field(default_factory=list)
+    # Reasoning consumes completion budget; keep headroom above genai.tokens.output_max.
+    output_max: int = 8192
+    # Daily relationship reflection needs room for thinking + multi-user JSON.
+    relationship_reflection_output_max: int = 32768
+    # When set and still in the future, every Discord user gets Max Thinking.
+    everyone_until: Optional[datetime] = None
+    # Discord OAuth invite permissions integer (View Channel, Send, History, Embed,
+    # Attach, Connect, Speak, View Audit Log, Add Reactions).
+    invite_permissions: int = 3263680
+    # Days to keep a subscriber guild after the sponsor's SuperSigrok lapses.
+    guild_grace_days: int = 3
+    # Global free-user @mention quota (SuperSigrok users skip).
+    free_replies_per_window: int = 8
+    free_window_minutes: int = 60
+    # Max completion tokens for the in-character rate-limit cooldown reply.
+    cheap_output_max: int = 80
+    # Stripe Checkout (empty price_id → inline $5 USD/month price_data).
+    stripe_price_id: str = ""
+    stripe_amount_cents: int = 500
+    stripe_currency: str = "usd"
+    stripe_product_name: str = "SuperSigrok"
+    stripe_success_url: str = "https://discord.com/channels/@me"
+    stripe_cancel_url: str = "https://discord.com/channels/@me"
+    stripe_webhook_host: str = "0.0.0.0"
+    stripe_webhook_port: int = 8788
+    stripe_webhook_path: str = "/stripe/webhook"
+
+
 class BotSettings(BaseModel):
     prefix: str
     temp_dir: str
@@ -178,6 +217,7 @@ class BotSettings(BaseModel):
     event_posts: list[EventPostRule] = Field(default_factory=list)
     timed_posts: list[TimedPostRule] = Field(default_factory=list)
     schedule_controller_user_ids: list[int] = Field(default_factory=list)
+    supersigrok: SupersigrokSettings = Field(default_factory=SupersigrokSettings)
 
 
 class GenaiHistorySettings(BaseModel):
@@ -193,6 +233,10 @@ class GenaiWebSearchSettings(BaseModel):
     enabled: bool = False
     max_results: int = 5
     timeout_seconds: int = 10
+    provider: Literal["searxng"] = "searxng"
+    base_url: str = "http://192.168.0.241:8080"
+    language: str = "all"
+    categories: str = "general"
 
 
 class GenaiDiscordStreamingSettings(BaseModel):
